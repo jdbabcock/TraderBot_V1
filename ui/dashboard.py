@@ -62,8 +62,16 @@ class RealTimeEquityPlot:
         self._win_loss_jsonl_mtime = 0.0
         self._win_loss_trades_mtime = 0.0
         self._win_loss_cache_path = os.path.join("data", "wl_cache.json")
+        self._realized_cache_mtime = 0.0
+        self._realized_cache_total = None
+        self._realized_cache_trades = 0
         self._autopilot_tune_mtime = 0.0
         self._autopilot_tune_last = ""
+        self._snapshot_stats_mtime = 0.0
+        self._snapshot_first_value = None
+        self._snapshot_first_ts = None
+        self._snapshot_peak_value = None
+        self._snapshot_peak_ts = None
         self._load_equity_history()
 
         # -----------------------------
@@ -208,7 +216,7 @@ class RealTimeEquityPlot:
         self.pnl_label.pack(side=tk.LEFT, padx=10)
         
         self.realized_pnl_label = tk.Label(
-            self.header_frame, text="Realized PnL: $0.00", font=("Helvetica", 12), bg=self.panel, fg=self.text
+            self.header_frame, text="Historical PnL: $0.00 (0.0%)", font=("Helvetica", 12), bg=self.panel, fg=self.text
         )
         self.realized_pnl_label.pack(side=tk.LEFT, padx=10)
 
@@ -789,6 +797,53 @@ class RealTimeEquityPlot:
         except Exception:
             return self._win_loss_counts
 
+    def _compute_realized_stats(self):
+        trades_path = os.path.join("data", "live_trades.csv")
+        if os.path.exists(trades_path):
+            mtime = os.path.getmtime(trades_path)
+            if mtime != self._realized_cache_mtime:
+                total = 0.0
+                trade_count = 0
+                pnl_by_symbol = {}
+                qty_by_symbol = {}
+                try:
+                    with open(trades_path, "r", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            sym = row.get("symbol") or ""
+                            side = (row.get("side") or "").upper()
+                            try:
+                                qty = float(row.get("qty") or 0.0)
+                                price = float(row.get("price") or 0.0)
+                            except Exception:
+                                continue
+                            if qty <= 0 or price <= 0:
+                                continue
+                            cost = pnl_by_symbol.get(sym, 0.0)
+                            held = qty_by_symbol.get(sym, 0.0)
+                            if side == "BUY":
+                                cost += qty * price
+                                held += qty
+                            elif side == "SELL":
+                                if held > 0:
+                                    avg_cost = cost / held if held else 0.0
+                                    reduce_qty = min(held, qty)
+                                    realized = (price - avg_cost) * reduce_qty
+                                    total += realized
+                                    trade_count += 1
+                                    cost -= avg_cost * reduce_qty
+                                    held -= reduce_qty
+                            pnl_by_symbol[sym] = cost
+                            qty_by_symbol[sym] = held
+                    self._realized_cache_total = total
+                    self._realized_cache_trades = trade_count
+                    self._realized_cache_mtime = mtime
+                except Exception:
+                    pass
+            return self._realized_cache_total, self._realized_cache_trades
+
+        return None, 0
+
     def _save_win_loss_cache(self):
         try:
             os.makedirs(os.path.dirname(self._win_loss_cache_path), exist_ok=True)
@@ -837,6 +892,84 @@ class RealTimeEquityPlot:
             return message
         except Exception:
             return self._autopilot_tune_last
+
+    def _load_portfolio_snapshot_stats(self):
+        path = os.path.join("logs", "portfolio_snapshots.jsonl")
+        if not os.path.exists(path):
+            return (None, None, None, None)
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime == self._snapshot_stats_mtime:
+                return (
+                    self._snapshot_first_value,
+                    self._snapshot_first_ts,
+                    self._snapshot_peak_value,
+                    self._snapshot_peak_ts,
+                )
+            first_val = None
+            first_ts = None
+            peak_val = None
+            peak_ts = None
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = float(row.get("timestamp") or 0.0)
+                    snap = row.get("snapshot") or {}
+                    val = None
+                    for key in ("equity_usd", "total_usd", "cash_usd"):
+                        if snap.get(key) not in (None, "", "None"):
+                            try:
+                                val = float(snap.get(key))
+                            except Exception:
+                                val = None
+                            break
+                    if val is None or not math.isfinite(val) or val <= 0:
+                        continue
+                    if first_ts is None or (ts and ts < first_ts):
+                        first_ts = ts
+                        first_val = val
+                    if peak_val is None or val > peak_val:
+                        peak_val = val
+                        peak_ts = ts
+            self._snapshot_stats_mtime = mtime
+            self._snapshot_first_value = first_val
+            self._snapshot_first_ts = first_ts
+            self._snapshot_peak_value = peak_val
+            self._snapshot_peak_ts = peak_ts
+            return (first_val, first_ts, peak_val, peak_ts)
+        except Exception:
+            return (
+                self._snapshot_first_value,
+                self._snapshot_first_ts,
+                self._snapshot_peak_value,
+                self._snapshot_peak_ts,
+            )
+
+    def _get_historical_baseline(self):
+        hist_peak = None
+        if self.equity_history:
+            try:
+                hist_peak = max(float(x) for x in self.equity_history if math.isfinite(float(x)))
+            except Exception:
+                hist_peak = None
+
+        _snap_first_val, _snap_first_ts, snap_peak_val, _snap_peak_ts = self._load_portfolio_snapshot_stats()
+        candidates = []
+        if hist_peak is not None and hist_peak > 0:
+            candidates.append(hist_peak)
+        if snap_peak_val is not None and snap_peak_val > 0:
+            candidates.append(snap_peak_val)
+        if self.start_equity is not None and self.start_equity > 0:
+            candidates.append(float(self.start_equity))
+        if self.baseline is not None and self.baseline > 0:
+            candidates.append(float(self.baseline))
+        return float(max(candidates) if candidates else 0.0)
 
     def _get_filtered_series(self):
         if not self.equity_history:
@@ -1245,7 +1378,18 @@ class RealTimeEquityPlot:
         if realized_total is None:
             realized_map = getattr(self.trader, "realized_pnl_by_symbol", {}) or {}
             realized_total = sum(float(v or 0.0) for v in realized_map.values()) if isinstance(realized_map, dict) else 0.0
-        self.realized_pnl_label.config(text=f"Realized PnL: ${float(realized_total):.2f}")
+        # Historical PnL: current total value vs. historical baseline
+        current_total = None
+        if isinstance(account_info, dict):
+            current_total = account_info.get("total_usd")
+        if current_total is None:
+            current_total = float(self.trader.equity(live_prices) or 0.0) if hasattr(self.trader, "equity") else None
+        if current_total is None:
+            current_total = 0.0
+        baseline_value = self._get_historical_baseline()
+        hist_pnl = float(current_total) - baseline_value if baseline_value > 0 else 0.0
+        hist_pct = (hist_pnl / baseline_value * 100.0) if baseline_value > 0 else 0.0
+        self.realized_pnl_label.config(text=f"Historical PnL: ${hist_pnl:.2f} ({hist_pct:.2f}%)")
         self.baseline = max(0, getattr(self.trader, "starting_capital", 0))
         self.baseline_line.set_ydata([self.baseline, self.baseline])
 

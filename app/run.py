@@ -632,8 +632,83 @@ def _load_perf_guard_history():
     global _win_count, _loss_count, _realized_total, _autopilot_trade_pnls
     if not PERF_GUARD_PERSIST or PERF_GUARD_MODE.lower() == "session":
         return
+    state_total = None
+    state_path = os.path.join("data", "live_positions.json")
+    try:
+        if os.path.exists(state_path):
+            with open(state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("realized_pnl_total") is not None:
+                state_total = float(data.get("realized_pnl_total") or 0.0)
+    except Exception:
+        state_total = None
+    trades_csv = os.path.join("data", "live_trades.csv")
+    trade_pnls = None
+    trade_wins = 0
+    trade_losses = 0
+    trade_total = 0.0
+    if os.path.exists(trades_csv):
+        try:
+            per_symbol = {}
+            with open(trades_csv, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    symbol = row.get("symbol")
+                    if not symbol:
+                        continue
+                    try:
+                        qty = float(row.get("qty", 0.0) or 0.0)
+                        price = float(row.get("price", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    side = str(row.get("side", "")).upper()
+                    if qty <= 0 or price <= 0 or side not in ("BUY", "SELL"):
+                        continue
+                    per_symbol.setdefault(symbol, []).append((row.get("timestamp") or 0, side, qty, price))
+            pnl_list = []
+            for symbol, trades in per_symbol.items():
+                trades.sort(key=lambda x: x[0])
+                qty = 0.0
+                cost = 0.0
+                for _, side, t_qty, t_price in trades:
+                    if side == "BUY":
+                        cost += t_qty * t_price
+                        qty += t_qty
+                    else:
+                        if qty <= 0:
+                            continue
+                        avg_cost = cost / qty if qty else 0.0
+                        reduce_qty = min(qty, t_qty)
+                        realized = (t_price - avg_cost) * reduce_qty
+                        cost -= avg_cost * reduce_qty
+                        qty -= reduce_qty
+                        trade_total += realized
+                        pnl_list.append(realized)
+                        if realized > 0:
+                            trade_wins += 1
+                        elif realized < 0:
+                            trade_losses += 1
+            if pnl_list:
+                trade_pnls = pnl_list
+                _win_count = trade_wins
+                _loss_count = trade_losses
+                _autopilot_trade_pnls = pnl_list[-AUTOPILOT_MAX_RECENT_TRADES:]
+        except Exception:
+            trade_pnls = None
+
+    if trade_pnls:
+        _realized_total = state_total if state_total is not None else trade_total
+        if state_total is not None:
+            print(f"[PERF_GUARD] Loaded {len(trade_pnls)} trades from live_trades.csv (wins={trade_wins} losses={trade_losses} realized_total={_realized_total:.2f})")
+        else:
+            print(f"[PERF_GUARD] Loaded {len(trade_pnls)} trades from live_trades.csv (wins={trade_wins} losses={trade_losses} realized_total={_realized_total:.2f})")
+        return
+
     path = os.path.join("logs", "order_actions.jsonl")
     if not os.path.exists(path):
+        if state_total is not None:
+            _realized_total = state_total
+            print(f"[PERF_GUARD] Loaded realized_total from live_positions.json: {_realized_total:.2f}")
         return
     try:
         max_trades = max(1, int(PERF_GUARD_LOOKBACK_TRADES or 0))
@@ -655,11 +730,14 @@ def _load_perf_guard_history():
                 realized = payload.get("realized_pnl")
                 if realized is None or realized == "":
                     continue
+                outcome = payload.get("outcome")
+                mode = payload.get("mode")
+                if outcome not in ("W", "L", "B") and mode not in ("pnl_exit", "rebalance"):
+                    continue
                 try:
                     realized = float(realized)
                 except Exception:
                     continue
-                outcome = payload.get("outcome")
                 entries.append((realized, outcome))
         if not entries:
             return
@@ -688,7 +766,11 @@ def _load_perf_guard_history():
         _realized_total = total
         if pnl_list:
             _autopilot_trade_pnls = pnl_list[-AUTOPILOT_MAX_RECENT_TRADES:]
-        print(f"[PERF_GUARD] Loaded {len(entries)} trades from history (wins={wins} losses={losses} realized_total={total:.2f})")
+        if state_total is not None:
+            _realized_total = state_total
+            print(f"[PERF_GUARD] Loaded {len(entries)} trades from history (wins={wins} losses={losses} realized_total={total:.2f}); using live_positions total={state_total:.2f}")
+        else:
+            print(f"[PERF_GUARD] Loaded {len(entries)} trades from history (wins={wins} losses={losses} realized_total={total:.2f})")
     except Exception:
         return
 
