@@ -1332,6 +1332,7 @@ while True:
             if equity > 0:
                 daily_start_equity = equity
                 peak_equity = equity
+                print(f"[RISK_RESET] Daily reset to equity={equity:.2f} ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
         if equity > 0 and daily_start_equity is None:
             daily_start_equity = equity
         if equity > 0 and (peak_equity is None or equity > peak_equity):
@@ -1340,7 +1341,7 @@ while True:
             daily_start_equity = equity
             peak_equity = equity
             _risk_reset_done = True
-            print(f"[RISK_RESET] Baselines reset to equity={equity:.2f}")
+            print(f"[RISK_RESET] Baselines reset to equity={equity:.2f} ts={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 
         total_notional, per_symbol_notional = _compute_open_notional(trader, prices)
         open_positions = len(getattr(trader, "positions", {}) or {})
