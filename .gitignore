@@ -1,0 +1,17 @@
+# Build artifacts
+/dist/
+/build/
+/build_onefile/
+*.spec
+__pycache__/
+*.pyc
+/data/
+/logs/
+*.log
+/venv/
+/env/
+/.venv/
+*.exe
+*.pkg
+*.zip
+python312.dll

@@ -1,0 +1,17 @@
+{
+  "generated_at": "2026-02-03T03:35:13.430977Z",
+  "trades_file": "trades.csv",
+  "llm_log_file": "llm_activity.log",
+  "summary": {
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "win_rate": 0.0,
+    "avg_pnl": 0.0,
+    "total_pnl": 0,
+    "profit_factor": null,
+    "max_drawdown": 0.0
+  },
+  "per_symbol": {},
+  "llm_alignment_samples": []
+}

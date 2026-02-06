@@ -1,0 +1,1 @@
+timestamp,symbol,side,price,size,pnl,equity,reason,sentiment_score,velocity,llm_decision,trailing_stop_pct,fill_price,status,notional,slippage_bps,latency_ms,result
