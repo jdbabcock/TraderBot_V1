@@ -1,41 +1,45 @@
 # Trader Bot
 
-## Getting Started
-1. Install dependencies:
+## Quick Start (Windows PowerShell)
+1. Open PowerShell in the project folder.
+2. Create a virtual environment:
+```powershell
+python -m venv .venv
 ```
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+3. Activate it:
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
-2. Add your API keys in `config/.env` (placeholders are already provided).
-3. Start the bot:
+4. Install dependencies:
+```powershell
+python -m pip install -r requirements.txt
 ```
+5. Add your API keys in `config/.env` (placeholders are provided).
+6. Start the bot:
+```powershell
 .\run.ps1
 ```
 
-Notes:
-- `config/.env` must contain your OpenAI and exchange keys before starting.
-- Runtime data is written to `data/` and `logs/`.
-
-## Run
-Setup:
-```
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-Recommended (PowerShell):
-```
-.\run.ps1
-```
-
-Recommended (Git Bash):
-```
+## Alternative (Git Bash)
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+python -m pip install -r requirements.txt
 ./run.sh
 ```
 
-Direct (venv Python):
-```
+## Direct Run (without run.ps1)
+```powershell
 .\.venv\Scripts\python.exe app\run.py
 ```
 
+## Notes
+1. If PowerShell blocks scripts, run this once:
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+2. `config/.env` must contain your OpenAI and exchange keys before starting.
+3. Runtime data is written to `data/` and `logs/`.
 
 ## Project Layout
 - `app/` entrypoint and runtime orchestration (`run.py`)

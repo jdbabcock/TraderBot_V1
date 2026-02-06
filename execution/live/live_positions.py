@@ -196,6 +196,12 @@ class LivePortfolio:
             for t in trades_sorted:
                 trade_qty = float(t.get("qty", t.get("executedQty", 0.0)) or 0.0)
                 trade_price = float(t.get("price", 0.0) or 0.0)
+                if trade_qty <= 0 or trade_price <= 0:
+                    try:
+                        print(f"[POSITIONS] Skipped trade with invalid qty/price: qty={trade_qty} price={trade_price}")
+                    except Exception:
+                        pass
+                    continue
                 is_buyer = t.get("isBuyer")
                 side = t.get("side")
                 if is_buyer is None and side:
