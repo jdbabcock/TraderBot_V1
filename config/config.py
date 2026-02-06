@@ -93,6 +93,16 @@ TIMEFRAME = "5m"
 # LLM cadence (style presets can override this)
 LLM_CHECK_INTERVAL = 60
 
+# Sentiment contrarian settings
+# - CONTRARIAN_SENTIMENT_ENABLED: apply contrarian adjustment at extremes
+# - CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD: abs(sentiment) level to start contrarian weighting
+# - CONTRARIAN_SENTIMENT_MAX_WEIGHT: max inversion weight applied at |sentiment|=1.0
+# - CONTRARIAN_SENTIMENT_LOG: log raw vs adjusted sentiment
+CONTRARIAN_SENTIMENT_ENABLED = True
+CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD = 0.7
+CONTRARIAN_SENTIMENT_MAX_WEIGHT = 0.6
+CONTRARIAN_SENTIMENT_LOG = False
+
 # Risk limits (percent-based, halt new trades only)
 # - DAILY_LOSS_LIMIT_PCT: max loss from day start equity before pausing new trades
 # - MAX_DRAWDOWN_PCT: max drawdown from peak equity before pausing new trades
@@ -162,6 +172,10 @@ CONFIG_DOC = {
     "SYMBOLS": "List of market symbols to trade.",
     "TIMEFRAME": "OHLCV timeframe used for indicators.",
     "LLM_CHECK_INTERVAL": "Seconds between LLM calls per symbol.",
+    "CONTRARIAN_SENTIMENT_ENABLED": "If true, apply contrarian weighting to extreme sentiment scores.",
+    "CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD": "Absolute sentiment level where contrarian weighting begins (0-1).",
+    "CONTRARIAN_SENTIMENT_MAX_WEIGHT": "Max inversion weight at |sentiment|=1.0 (0-1).",
+    "CONTRARIAN_SENTIMENT_LOG": "If true, log raw vs adjusted sentiment values.",
     "DAILY_LOSS_LIMIT_PCT": "Max daily loss (fraction of day-start equity) before pausing new trades.",
     "MAX_DRAWDOWN_PCT": "Max drawdown (fraction from equity peak) before pausing new trades.",
     "MAX_TOTAL_EXPOSURE_PCT": "Max total open notional as a fraction of equity.",

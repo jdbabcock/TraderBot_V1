@@ -23,6 +23,19 @@ import pandas as pd
 # -----------------------------
 USE_LLM = True
 TOKEN_FREE_MODE = False
+CONTRARIAN_SENTIMENT_ENABLED = False
+CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD = 0.7
+CONTRARIAN_SENTIMENT_MAX_WEIGHT = 0.6
+CONTRARIAN_SENTIMENT_LOG = False
+
+try:
+    from config import config as bot_config
+    CONTRARIAN_SENTIMENT_ENABLED = bool(getattr(bot_config, "CONTRARIAN_SENTIMENT_ENABLED", CONTRARIAN_SENTIMENT_ENABLED))
+    CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD = float(getattr(bot_config, "CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD", CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD))
+    CONTRARIAN_SENTIMENT_MAX_WEIGHT = float(getattr(bot_config, "CONTRARIAN_SENTIMENT_MAX_WEIGHT", CONTRARIAN_SENTIMENT_MAX_WEIGHT))
+    CONTRARIAN_SENTIMENT_LOG = bool(getattr(bot_config, "CONTRARIAN_SENTIMENT_LOG", CONTRARIAN_SENTIMENT_LOG))
+except Exception:
+    pass
 
 # -----------------------------
 # Prompt tracking (debug/UI)
@@ -98,6 +111,24 @@ BEARISH_WORDS = ["dump", "drop", "bearish", "plunge", "crash", "rekt", "sell-off
 # -----------------------------
 # Internal function to fetch sentiment & volume context
 # -----------------------------
+def _apply_contrarian_sentiment(score):
+    if not CONTRARIAN_SENTIMENT_ENABLED:
+        return score
+    try:
+        s = float(score)
+    except Exception:
+        return score
+    abs_score = abs(s)
+    if abs_score <= CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD:
+        return s
+    span = max(1e-9, 1.0 - CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD)
+    weight = min(1.0, (abs_score - CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD) / span) * CONTRARIAN_SENTIMENT_MAX_WEIGHT
+    adjusted = s * (1.0 - 2.0 * weight)
+    adjusted = max(-1.0, min(1.0, adjusted))
+    if CONTRARIAN_SENTIMENT_LOG:
+        print(f"[{time.strftime('%H:%M:%S')}] 🔁 Contrarian sentiment: raw={s:.3f} w={weight:.2f} adj={adjusted:.3f}")
+    return adjusted
+
 def _fetch_sentiment(symbol, ohlcv_df=None):
     global LAST_RSS_FETCH_TIME
     now = time.time()
@@ -133,7 +164,8 @@ def _fetch_sentiment(symbol, ohlcv_df=None):
             total_score += polarity
             count += 1
 
-    sentiment = total_score / count if count > 0 else 0.0
+    raw_sentiment = total_score / count if count > 0 else 0.0
+    sentiment = _apply_contrarian_sentiment(raw_sentiment)
 
     # Volume context
     current_vol = avg_vol = vol_ratio = None
@@ -144,13 +176,14 @@ def _fetch_sentiment(symbol, ohlcv_df=None):
 
     SENTIMENT_CACHE[symbol] = {
         "score": sentiment,
+        "raw_score": raw_sentiment,
         "timestamp": now,
         "current_vol": current_vol,
         "avg_vol": avg_vol,
         "vol_ratio": vol_ratio
     }
 
-    print(f"[{time.strftime('%H:%M:%S')}] 📰 RSS updated for {symbol}: Sentiment={sentiment:.3f} | Vol={current_vol} | AvgVol={avg_vol} | Ratio={vol_ratio}")
+    print(f"[{time.strftime('%H:%M:%S')}] 📰 RSS updated for {symbol}: Sentiment={sentiment:.3f} (raw={raw_sentiment:.3f}) | Vol={current_vol} | AvgVol={avg_vol} | Ratio={vol_ratio}")
     LAST_RSS_FETCH_TIME = time.time()
     return sentiment, current_vol, avg_vol, vol_ratio
 
@@ -163,13 +196,23 @@ def fetch_sentiment_score(symbol, ohlcv_df=None):
     if TOKEN_FREE_MODE:
         score = random.uniform(-1, 1)
         vol_info = (random.uniform(100, 1000), random.uniform(100, 1000), random.uniform(0.5, 1.5))
-        print(f"[{time.strftime('%H:%M:%S')}] 🔹 TOKEN-FREE sentiment for {symbol}: {score:.3f}")
-        return score, *vol_info
+        adjusted = _apply_contrarian_sentiment(score)
+        print(f"[{time.strftime('%H:%M:%S')}] 🔹 TOKEN-FREE sentiment for {symbol}: {adjusted:.3f} (raw={score:.3f})")
+        return adjusted, *vol_info
 
     cached = SENTIMENT_CACHE.get(symbol)
     if cached and now - cached["timestamp"] < CACHE_INTERVAL:
-        print(f"[{time.strftime('%H:%M:%S')}] 🔹 Using cached sentiment for {symbol}: {cached['score']:.3f}")
-        return cached["score"], cached.get("current_vol"), cached.get("avg_vol"), cached.get("vol_ratio")
+        cached_score = cached.get("score", 0.0)
+        if "raw_score" in cached:
+            raw_score = cached.get("raw_score", cached_score)
+            adjusted = cached_score
+        else:
+            raw_score = cached_score
+            adjusted = _apply_contrarian_sentiment(cached_score)
+            cached["score"] = adjusted
+            cached["raw_score"] = raw_score
+        print(f"[{time.strftime('%H:%M:%S')}] 🔹 Using cached sentiment for {symbol}: {adjusted:.3f} (raw={raw_score:.3f})")
+        return adjusted, cached.get("current_vol"), cached.get("avg_vol"), cached.get("vol_ratio")
 
     return _fetch_sentiment(symbol, ohlcv_df)
 
@@ -349,7 +392,7 @@ def llm_decision(
             f"Last price: {last_price}\n"
             f"Recent closes: [{recent_prices_str}]\n"
             f"Price velocity (% change): {velocity:.2f}\n"
-            f"Sentiment score (-1 to 1): {sentiment:.2f}\n"
+            f"Sentiment score (-1 to 1, contrarian-adjusted at extremes): {sentiment:.2f}\n"
             f"Current open positions: {json.dumps(positions)}\n"
             f"Technical price score (0–1, bullish): {price_score:.2f}\n"
             f"RSI: {rsi}\nEMA-20: {ema_20}\nVWAP: {vwap}\n"

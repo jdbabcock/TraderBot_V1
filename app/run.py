@@ -215,6 +215,11 @@ try:
     import core.data.llm_signal_engine as llm_signal_engine
     llm_signal_engine.OPENAI_KEY = os.getenv("OPENAI_API_KEY")
     llm_signal_engine.openai.api_key = os.getenv("OPENAI_API_KEY")
+    if bot_config:
+        llm_signal_engine.CONTRARIAN_SENTIMENT_ENABLED = bool(getattr(bot_config, "CONTRARIAN_SENTIMENT_ENABLED", llm_signal_engine.CONTRARIAN_SENTIMENT_ENABLED))
+        llm_signal_engine.CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD = float(getattr(bot_config, "CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD", llm_signal_engine.CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD))
+        llm_signal_engine.CONTRARIAN_SENTIMENT_MAX_WEIGHT = float(getattr(bot_config, "CONTRARIAN_SENTIMENT_MAX_WEIGHT", llm_signal_engine.CONTRARIAN_SENTIMENT_MAX_WEIGHT))
+        llm_signal_engine.CONTRARIAN_SENTIMENT_LOG = bool(getattr(bot_config, "CONTRARIAN_SENTIMENT_LOG", llm_signal_engine.CONTRARIAN_SENTIMENT_LOG))
 except Exception:
     pass
 
@@ -1220,6 +1225,14 @@ while True:
                     importlib.reload(bot_config)
                     DISPLAY_MODE = getattr(bot_config, "RUN_MODE", DISPLAY_MODE)
                     DISPLAY_STYLE = getattr(bot_config, "TRADING_STYLE", DISPLAY_STYLE)
+                    try:
+                        import core.data.llm_signal_engine as llm_signal_engine
+                        llm_signal_engine.CONTRARIAN_SENTIMENT_ENABLED = bool(getattr(bot_config, "CONTRARIAN_SENTIMENT_ENABLED", llm_signal_engine.CONTRARIAN_SENTIMENT_ENABLED))
+                        llm_signal_engine.CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD = float(getattr(bot_config, "CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD", llm_signal_engine.CONTRARIAN_SENTIMENT_EXTREME_THRESHOLD))
+                        llm_signal_engine.CONTRARIAN_SENTIMENT_MAX_WEIGHT = float(getattr(bot_config, "CONTRARIAN_SENTIMENT_MAX_WEIGHT", llm_signal_engine.CONTRARIAN_SENTIMENT_MAX_WEIGHT))
+                        llm_signal_engine.CONTRARIAN_SENTIMENT_LOG = bool(getattr(bot_config, "CONTRARIAN_SENTIMENT_LOG", llm_signal_engine.CONTRARIAN_SENTIMENT_LOG))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
         
