@@ -1423,7 +1423,15 @@ while True:
                 if positions_ready and acc_total > 0 and account_info.get("cash_usd") is not None:
                     if has_non_cash:
                         min_delta = max(1.0, 0.005 * max(acc_total, 1.0))
-                        trading_ready_now = (acc_total - acc_cash) >= min_delta
+                        non_cash_delta = (acc_total - acc_cash)
+                        positions_count = int(account_info.get("positions_count") or 0)
+                        dust_notional = total_notional < max(1.0, MIN_NOTIONAL)
+                        if non_cash_delta >= min_delta:
+                            trading_ready_now = True
+                        elif positions_count == 0 or dust_notional:
+                            trading_ready_now = True
+                        else:
+                            trading_ready_now = False
                     else:
                         trading_ready_now = True
             except Exception:
