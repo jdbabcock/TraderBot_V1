@@ -60,6 +60,9 @@ UI_REFRESH_SECONDS = 1
 DEBUG_STATUS = True
 DEBUG_LOG_ATTEMPTS = True
 RESET_DAILY_RISK_ON_START = True
+PERF_GUARD_PERSIST = True
+PERF_GUARD_MODE = "rolling"  # "rolling" or "session"
+PERF_GUARD_LOOKBACK_TRADES = 200
 
 # Stale price detection (warn when the websocket feed pauses)
 # - STALE_PRICE_SECONDS: age threshold for a price to be considered stale
@@ -158,6 +161,9 @@ CONFIG_DOC = {
     "DEBUG_STATUS": "If true, print periodic status diagnostics to the console.",
     "DEBUG_LOG_ATTEMPTS": "If true, log every trade attempt (no dedup/cooldown).",
     "RESET_DAILY_RISK_ON_START": "If true, reset daily loss/drawdown baselines on startup.",
+    "PERF_GUARD_PERSIST": "If true, load recent trade performance from logs on startup.",
+    "PERF_GUARD_MODE": "Performance guard mode: 'rolling' to use recent history, 'session' to reset each run.",
+    "PERF_GUARD_LOOKBACK_TRADES": "Number of most recent trades to load for performance guard.",
     "STALE_PRICE_SECONDS": "Seconds before a price is considered stale.",
     "STALE_WARN_INTERVAL_SECONDS": "Minimum seconds between stale warnings per symbol.",
     "STALE_GRACE_SECONDS": "Startup grace period before stale warnings start.",

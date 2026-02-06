@@ -268,6 +268,9 @@ UI_REFRESH_SECONDS = getattr(bot_config, "UI_REFRESH_SECONDS", 1) if bot_config 
 DEBUG_STATUS = getattr(bot_config, "DEBUG_STATUS", False) if bot_config else False
 DEBUG_LOG_ATTEMPTS = getattr(bot_config, "DEBUG_LOG_ATTEMPTS", False) if bot_config else False
 RESET_DAILY_RISK_ON_START = getattr(bot_config, "RESET_DAILY_RISK_ON_START", True) if bot_config else True
+PERF_GUARD_PERSIST = bool(getattr(bot_config, "PERF_GUARD_PERSIST", True)) if bot_config else True
+PERF_GUARD_MODE = str(getattr(bot_config, "PERF_GUARD_MODE", "rolling")) if bot_config else "rolling"
+PERF_GUARD_LOOKBACK_TRADES = int(getattr(bot_config, "PERF_GUARD_LOOKBACK_TRADES", 200)) if bot_config else 200
 STALE_PRICE_SECONDS = getattr(bot_config, "STALE_PRICE_SECONDS", 15) if bot_config else 15
 STALE_WARN_INTERVAL_SECONDS = getattr(bot_config, "STALE_WARN_INTERVAL_SECONDS", 60) if bot_config else 60
 STALE_GRACE_SECONDS = getattr(bot_config, "STALE_GRACE_SECONDS", 20) if bot_config else 20
@@ -624,6 +627,70 @@ def _record_win_loss(realized_pnl, symbol=None):
     elif pnl_val < 0:
         _loss_count += 1
     print(f"[TRADE_CLOSE] {symbol or ''} realized_pnl={pnl_val:.4f} wins={_win_count} losses={_loss_count} total_realized={_realized_total:.4f}")
+
+def _load_perf_guard_history():
+    global _win_count, _loss_count, _realized_total, _autopilot_trade_pnls
+    if not PERF_GUARD_PERSIST or PERF_GUARD_MODE.lower() == "session":
+        return
+    path = os.path.join("logs", "order_actions.jsonl")
+    if not os.path.exists(path):
+        return
+    try:
+        max_trades = max(1, int(PERF_GUARD_LOOKBACK_TRADES or 0))
+    except Exception:
+        max_trades = 200
+    if max_trades <= 0:
+        return
+    entries = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                realized = payload.get("realized_pnl")
+                if realized is None or realized == "":
+                    continue
+                try:
+                    realized = float(realized)
+                except Exception:
+                    continue
+                outcome = payload.get("outcome")
+                entries.append((realized, outcome))
+        if not entries:
+            return
+        entries = entries[-max_trades:]
+        wins = 0
+        losses = 0
+        total = 0.0
+        pnl_list = []
+        for realized, outcome in entries:
+            total += realized
+            pnl_list.append(realized)
+            if isinstance(outcome, str):
+                o = outcome.upper()
+                if o == "W":
+                    wins += 1
+                    continue
+                if o == "L":
+                    losses += 1
+                    continue
+            if realized > 0:
+                wins += 1
+            elif realized < 0:
+                losses += 1
+        _win_count = wins
+        _loss_count = losses
+        _realized_total = total
+        if pnl_list:
+            _autopilot_trade_pnls = pnl_list[-AUTOPILOT_MAX_RECENT_TRADES:]
+        print(f"[PERF_GUARD] Loaded {len(entries)} trades from history (wins={wins} losses={losses} realized_total={total:.2f})")
+    except Exception:
+        return
 
 def _detect_candle_patterns(df):
     patterns = []
@@ -1144,6 +1211,7 @@ _autopilot_last_tune_ts = 0.0
 _perf_guard_state = "normal"
 _perf_guard_last_log = 0.0
 _autopilot_last_persist_ts = 0.0
+_load_perf_guard_history()
 
 def _initial_account_sync():
     try:
