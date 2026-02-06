@@ -72,6 +72,8 @@ class RealTimeEquityPlot:
         self._snapshot_first_ts = None
         self._snapshot_peak_value = None
         self._snapshot_peak_ts = None
+        self._equity_spike_candidate = None
+        self._equity_spike_count = 0
         self._load_equity_history()
 
         # -----------------------------
@@ -893,6 +895,49 @@ class RealTimeEquityPlot:
         except Exception:
             return self._autopilot_tune_last
 
+    def _filter_equity_spike(self, equity, live_prices):
+        if equity is None or not math.isfinite(equity):
+            return None
+        if not self.equity_history:
+            return equity
+        window = self.equity_history[-10:] if len(self.equity_history) >= 5 else list(self.equity_history)
+        if not window:
+            return equity
+        window_sorted = sorted(window)
+        median = window_sorted[len(window_sorted) // 2]
+        base = max(1.0, float(median))
+        # Estimate current exposure to allow larger moves when holding positions
+        exposure = 0.0
+        try:
+            for sym, pos in (self.trader.positions or {}).items():
+                size = float(pos.get("size", 0.0) or 0.0)
+                if size <= 0:
+                    continue
+                price = live_prices.get(sym)
+                if price is None and isinstance(sym, str) and "/" not in sym:
+                    slash_sym = f"{sym[:-3]}/{sym[-3:]}" if len(sym) > 3 else sym
+                    price = live_prices.get(slash_sym)
+                if price is None:
+                    price = float(pos.get("entry_price", 0.0) or 0.0)
+                exposure += size * float(price or 0.0)
+        except Exception:
+            exposure = 0.0
+        exposure_pct = exposure / base if base > 0 else 0.0
+        # Allow more variance with higher exposure, but cap extreme spikes.
+        max_jump = 0.06 + min(0.14, exposure_pct * 0.2)
+        max_jump = max(0.05, min(0.20, max_jump))
+        delta_pct = abs(float(equity) - base) / base
+        if delta_pct <= max_jump:
+            self._equity_spike_candidate = None
+            self._equity_spike_count = 0
+            return equity
+        # Clamp toward the new value to avoid vertical spikes.
+        last = self.equity_history[-1] if self.equity_history else base
+        step = max_jump * base
+        direction = 1.0 if float(equity) >= float(last) else -1.0
+        clamped = float(last) + direction * step
+        return clamped
+
     def _load_portfolio_snapshot_stats(self):
         path = os.path.join("logs", "portfolio_snapshots.jsonl")
         if not os.path.exists(path):
@@ -910,6 +955,7 @@ class RealTimeEquityPlot:
             first_ts = None
             peak_val = None
             peak_ts = None
+            window = []
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -931,12 +977,21 @@ class RealTimeEquityPlot:
                             break
                     if val is None or not math.isfinite(val) or val <= 0:
                         continue
+                    if window:
+                        median = sorted(window)[len(window) // 2]
+                        if median > 0:
+                            delta = abs(val - median) / median
+                            if delta > 0.2:
+                                continue
                     if first_ts is None or (ts and ts < first_ts):
                         first_ts = ts
                         first_val = val
                     if peak_val is None or val > peak_val:
                         peak_val = val
                         peak_ts = ts
+                    window.append(val)
+                    if len(window) > 20:
+                        window.pop(0)
             self._snapshot_stats_mtime = mtime
             self._snapshot_first_value = first_val
             self._snapshot_first_ts = first_ts
@@ -1207,11 +1262,18 @@ class RealTimeEquityPlot:
         have_prices = all(self.live_prices.get(sym) is not None for sym in required_symbols)
         have_equity = bool(self.wallet_snapshot) or (self.account_info.get("total_usd") is not None)
         have_indicators = True
+        missing_indicators = {}
         for sym in required_symbols:
             ind = self.market_indicators.get(sym, {})
-            if ind.get("ema20") is None or ind.get("vwap") is None or ind.get("vol_ratio") is None:
-                have_indicators = False
-                break
+            missing = []
+            if ind.get("ema20") is None:
+                missing.append("ema20")
+            if ind.get("vwap") is None:
+                missing.append("vwap")
+            if missing:
+                missing_indicators[sym] = missing
+        # Do not block dashboard on indicators; show UI with partial data.
+        have_indicators = True
         self._data_ready = bool(have_prices and have_equity and have_indicators)
         have_account = self.account_info and (self.account_info.get("total_usd") is not None) and (self.account_info.get("cash_usd") is not None)
         if have_account and self._account_first_seen is None:
@@ -1228,12 +1290,12 @@ class RealTimeEquityPlot:
             else:
                 wait_elapsed = False
             value_has_positions = bool(wait_elapsed and total_usd >= cash_usd and total_usd > 0)
+        # Do not block UI on positions readiness; show dashboard with cash-only accounts.
         account_value_ready = bool(
             have_account
-            and positions_ready
             and have_prices
+            and have_equity
             and have_indicators
-            and value_has_positions
         )
         skip_updates = False
         if not account_value_ready:
@@ -1243,6 +1305,12 @@ class RealTimeEquityPlot:
             self.syncing_label.config(text="Syncing data...")
             self._set_splash_visible(True)
             self._set_loading_visible(True)
+            if missing_indicators and (time.time() - self._ui_update_last) >= 2.0:
+                print(f"[DASH_SYNC] Indicators missing (non-blocking): {missing_indicators}")
+            if not have_prices and (time.time() - self._ui_update_last) >= 2.0:
+                print("[DASH_SYNC] Waiting prices from streams")
+            if not have_equity and (time.time() - self._ui_update_last) >= 2.0:
+                print("[DASH_SYNC] Waiting account equity")
             skip_updates = True
         else:
             if not self._heavy_ui_built:
@@ -1322,6 +1390,18 @@ class RealTimeEquityPlot:
         if not math.isfinite(equity) or equity <= 0:
             equity = self.equity_history[-1] if self.equity_history else 0.0
 
+        raw_equity = float(equity or 0.0)
+        # If account totals are cash-only while non-cash balances exist, keep last known equity.
+        try:
+            if self.account_info and self.account_info.get("has_non_cash_balances"):
+                cash_only = float(self.account_info.get("cash_usd") or 0.0)
+                total_usd = float(self.account_info.get("total_usd") or 0.0)
+                if total_usd <= cash_only + 0.01 and self.equity_history:
+                    raw_equity = float(self.equity_history[-1])
+        except Exception:
+            pass
+        chart_equity = raw_equity
+
         if not self._history_checked:
             if self.equity_history:
                 last = self.equity_history[-1]
@@ -1342,6 +1422,14 @@ class RealTimeEquityPlot:
             self.start_equity = float(self.trader.starting_capital)
 
         # If balances jump a lot with no positions, wait before appending to avoid spikes.
+        if self._data_ready:
+            filtered = self._filter_equity_spike(chart_equity, live_prices)
+            if filtered is None:
+                # Keep last stable value to avoid chart spikes.
+                chart_equity = self.equity_history[-1] if self.equity_history else chart_equity
+            else:
+                chart_equity = filtered
+
         if self._data_ready and self.equity_history:
             last_equity = self.equity_history[-1]
             try:
@@ -1349,7 +1437,7 @@ class RealTimeEquityPlot:
             except Exception:
                 no_positions = False
             if no_positions and last_equity > 0:
-                delta_pct = abs(equity - last_equity) / max(last_equity, 1.0)
+                delta_pct = abs(chart_equity - last_equity) / max(last_equity, 1.0)
                 if delta_pct >= 0.2:
                     # Skip this tick; keep history intact.
                     return
@@ -1357,7 +1445,7 @@ class RealTimeEquityPlot:
         if self._data_ready and not self._data_ready_once:
             self._data_ready_once = True
         if self._data_ready:
-            self.equity_history.append(equity)
+            self.equity_history.append(chart_equity)
             self.equity_timestamps.append(time.time())
             self._equity_save_counter += 1
             if self._equity_save_counter >= 10:
@@ -1366,26 +1454,20 @@ class RealTimeEquityPlot:
 
         # Update account summary
         open_pnl = self.trader.unrealized_pnl(live_prices)
-        denom = equity if equity and equity > 0 else 0.0
+        denom = raw_equity if raw_equity and raw_equity > 0 else 0.0
         if (not denom) and self.account_info and self.account_info.get("total_usd"):
             denom = float(self.account_info.get("total_usd")) or 0.0
         if not denom:
             denom = self.start_equity if self.start_equity and self.start_equity > 0 else max(1.0, getattr(self.trader, "starting_capital", 1.0))
         pnl_percent = (open_pnl / denom) * 100
-        self.total_equity_label.config(text=f"Total Value: ${equity:.2f}")
+        self.total_equity_label.config(text=f"Total Value: ${raw_equity:.2f}")
         self.pnl_label.config(text=f"Open PnL: ${open_pnl:.2f} ({pnl_percent:.2f}%)")
         realized_total = getattr(self.trader, "realized_pnl_total", None)
         if realized_total is None:
             realized_map = getattr(self.trader, "realized_pnl_by_symbol", {}) or {}
             realized_total = sum(float(v or 0.0) for v in realized_map.values()) if isinstance(realized_map, dict) else 0.0
         # Historical PnL: current total value vs. historical baseline
-        current_total = None
-        if isinstance(account_info, dict):
-            current_total = account_info.get("total_usd")
-        if current_total is None:
-            current_total = float(self.trader.equity(live_prices) or 0.0) if hasattr(self.trader, "equity") else None
-        if current_total is None:
-            current_total = 0.0
+        current_total = float(raw_equity or 0.0)
         baseline_value = self._get_historical_baseline()
         hist_pnl = float(current_total) - baseline_value if baseline_value > 0 else 0.0
         hist_pct = (hist_pnl / baseline_value * 100.0) if baseline_value > 0 else 0.0

@@ -14,6 +14,7 @@ print("🚀 Bot starting...")
 import os
 import time
 import json
+import math
 import random
 import threading
 import traceback
@@ -884,6 +885,76 @@ def _portfolio_snapshot(trader, prices, account_info, total_notional, per_symbol
         snapshot["allocation_deviation"] = {}
     return snapshot
 
+def _build_ta_context(symbol, indicators, recent_ohlcv, candle_patterns):
+    ind = indicators.get(symbol, {}) if isinstance(indicators, dict) else {}
+    return {
+        "rsi": ind.get("rsi"),
+        "ema_20": ind.get("ema20") if ind.get("ema20") is not None else ind.get("ema"),
+        "vwap": ind.get("vwap"),
+        "atr_pct": ind.get("atr_pct"),
+        "vol_ratio": ind.get("vol_ratio"),
+        "current_vol": ind.get("current_vol"),
+        "avg_vol": ind.get("avg_vol"),
+        "recent_ohlcv": recent_ohlcv,
+        "candle_patterns": candle_patterns or []
+    }
+
+def _build_perf_summary(win_count, loss_count, realized_total, trade_count, win_rate, underperforming, equity):
+    summary = {
+        "wins": win_count,
+        "losses": loss_count,
+        "realized_total": realized_total,
+        "win_rate": (win_rate if trade_count else 0.0),
+        "underperforming": underperforming,
+        "trade_count": trade_count
+    }
+    hist_baseline = _get_historical_baseline()
+    if hist_baseline is not None and hist_baseline > 0 and equity is not None:
+        hist_pnl = float(equity) - float(hist_baseline)
+        hist_pct = (hist_pnl / float(hist_baseline)) * 100.0
+        summary["historical_baseline"] = float(hist_baseline)
+        summary["historical_pnl"] = float(hist_pnl)
+        summary["historical_pnl_pct"] = float(hist_pct)
+    return summary
+
+def _build_risk_state(equity, drawdown_pct, daily_loss_pct, total_notional, per_symbol_notional, open_positions, confidence_gate):
+    exposure_ratio = (total_notional / equity) if equity and equity > 0 else 0.0
+    return {
+        "equity": float(equity) if equity is not None else None,
+        "drawdown_pct": float(drawdown_pct),
+        "daily_loss_pct": float(daily_loss_pct),
+        "exposure_ratio": float(exposure_ratio),
+        "total_notional": float(total_notional),
+        "per_symbol_notional": per_symbol_notional,
+        "open_positions": int(open_positions),
+        "max_drawdown_pct": float(MAX_DRAWDOWN_PCT),
+        "confidence_gate": float(confidence_gate) if confidence_gate is not None else None
+    }
+
+def _build_wallet_state(account_info, trader, equity):
+    state = {
+        "equity": float(equity) if equity is not None else None
+    }
+    if isinstance(account_info, dict):
+        state["cash_usd"] = account_info.get("cash_usd")
+        state["total_usd"] = account_info.get("total_usd")
+        state["has_non_cash_balances"] = account_info.get("has_non_cash_balances")
+    try:
+        state["positions"] = list(getattr(trader, "positions", {}) or {})
+    except Exception:
+        state["positions"] = []
+    return state
+
+def _build_execution_context(symbol, trades_by_symbol, portfolio_context):
+    return {
+        "symbol": symbol,
+        "mode": EXECUTION_MODE,
+        "style": TRADING_STYLE,
+        "llm_interval": LLM_CHECK_INTERVAL,
+        "recent_trades": trades_by_symbol.get(symbol, [])[-5:],
+        "portfolio": portfolio_context
+    }
+
 def _ensure_position_risk_defaults(trader):
     if not hasattr(trader, "positions"):
         return
@@ -1269,10 +1340,20 @@ _symbol_cooldown_log_state = {}
 SYMBOL_COOLDOWN_LOG_INTERVAL_SECONDS = 30
 _symbol_exposure_log_state = {}
 SYMBOL_EXPOSURE_LOG_INTERVAL_SECONDS = 30
+_reject_backoff_log_state = {}
+REJECT_BACKOFF_LOG_INTERVAL_SECONDS = 20
 _rebalance_log_state = {}
 _rebalance_advice_cache = {}
 _llm_action_log = []
 _llm_action_log_max = 200
+latest_llm_symbol = None
+latest_llm_summary = {}
+latest_llm_perf = {}
+latest_llm_risk = {}
+latest_llm_ta = {}
+latest_llm_sentiment = None
+latest_llm_wallet = {}
+latest_llm_ts = None
 
 def _append_llm_action_log(message):
     if not message:
@@ -1293,7 +1374,93 @@ _autopilot_last_tune_ts = 0.0
 _perf_guard_state = "normal"
 _perf_guard_last_log = 0.0
 _autopilot_last_persist_ts = 0.0
+_snapshot_stats_mtime = 0.0
+_snapshot_peak_value = None
+_equity_history_peak_mtime = 0.0
+_equity_history_peak_value = None
 _load_perf_guard_history()
+
+def _load_portfolio_snapshot_peak():
+    global _snapshot_stats_mtime, _snapshot_peak_value
+    path = os.path.join("logs", "portfolio_snapshots.jsonl")
+    if not os.path.exists(path):
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+        if mtime == _snapshot_stats_mtime:
+            return _snapshot_peak_value
+        peak_val = None
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                snap = row.get("snapshot") or {}
+                val = None
+                for key in ("equity_usd", "total_usd", "cash_usd"):
+                    if snap.get(key) not in (None, "", "None"):
+                        try:
+                            val = float(snap.get(key))
+                        except Exception:
+                            val = None
+                        break
+                if val is None or not math.isfinite(val) or val <= 0:
+                    continue
+                if peak_val is None or val > peak_val:
+                    peak_val = val
+        _snapshot_stats_mtime = mtime
+        _snapshot_peak_value = peak_val
+        return peak_val
+    except Exception:
+        return _snapshot_peak_value
+
+def _load_equity_history_peak():
+    global _equity_history_peak_mtime, _equity_history_peak_value
+    path = os.path.join("data", "equity_history.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+        if mtime == _equity_history_peak_mtime:
+            return _equity_history_peak_value
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        values = []
+        if isinstance(data, dict):
+            values = data.get("equity") or []
+        elif isinstance(data, list):
+            values = data
+        peak_val = None
+        for v in values:
+            try:
+                val = float(v)
+            except Exception:
+                continue
+            if not math.isfinite(val) or val <= 0:
+                continue
+            if peak_val is None or val > peak_val:
+                peak_val = val
+        _equity_history_peak_mtime = mtime
+        _equity_history_peak_value = peak_val
+        return peak_val
+    except Exception:
+        return _equity_history_peak_value
+
+def _get_historical_baseline():
+    candidates = []
+    snap_peak = _load_portfolio_snapshot_peak()
+    if snap_peak is not None and snap_peak > 0:
+        candidates.append(snap_peak)
+    hist_peak = _load_equity_history_peak()
+    if hist_peak is not None and hist_peak > 0:
+        candidates.append(hist_peak)
+    if candidates:
+        return float(max(candidates))
+    return None
 
 def _initial_account_sync():
     try:
@@ -1503,18 +1670,8 @@ while True:
             drawdown_pct = (equity - peak_equity) / peak_equity
 
         new_block_reasons = []
-        exposure_ratio = (total_notional / equity) if equity > 0 else 0.0
-        if DAILY_LOSS_LIMIT_PCT > 0 and daily_loss_pct <= -DAILY_LOSS_LIMIT_PCT:
-            new_block_reasons.append("DAILY_LOSS_LIMIT")
         if MAX_DRAWDOWN_PCT > 0 and drawdown_pct <= -MAX_DRAWDOWN_PCT:
             new_block_reasons.append("MAX_DRAWDOWN")
-        if MAX_OPEN_POSITIONS > 0 and open_positions >= MAX_OPEN_POSITIONS:
-            new_block_reasons.append("MAX_OPEN_POSITIONS")
-        if MAX_TOTAL_EXPOSURE_PCT > 0 and equity > 0:
-            if exposure_ratio >= MAX_TOTAL_EXPOSURE_PCT:
-                new_block_reasons.append("MAX_TOTAL_EXPOSURE")
-            elif "MAX_TOTAL_EXPOSURE" in block_reasons and exposure_ratio > MIN_EXPOSURE_RESUME_PCT:
-                new_block_reasons.append("MAX_TOTAL_EXPOSURE")
 
         if new_block_reasons != block_reasons:
             if new_block_reasons:
@@ -1536,7 +1693,7 @@ while True:
             status = "UNDERPERFORMING" if underperforming else "NORMAL"
             print(f"[PERF_GUARD] {status} win_rate={win_rate:.2%} trades={trade_count} realized_total={_realized_total:.2f}")
 
-        effective_min_conf = MIN_CONFIDENCE_TO_ORDER
+        effective_min_conf = 0.0
         effective_size_fraction = SIZE_FRACTION_DEFAULT
         effective_cooldown = COOLDOWN_SECONDS
         effective_symbol_cooldown = SYMBOL_COOLDOWN_SECONDS
@@ -1544,13 +1701,8 @@ while True:
         effective_take_profit = TAKE_PROFIT_PCT_DEFAULT
         effective_trailing = TRAILING_STOP_PCT_DEFAULT
         if underperforming:
-            effective_min_conf = min(0.9, MIN_CONFIDENCE_TO_ORDER + 0.15)
-            effective_size_fraction = max(0.02, SIZE_FRACTION_DEFAULT * 0.6)
-            effective_cooldown = max(COOLDOWN_SECONDS, 60) + 30
-            effective_symbol_cooldown = max(SYMBOL_COOLDOWN_SECONDS, 60)
-            effective_stop_loss = max(0.005, STOP_LOSS_PCT_DEFAULT * 0.8)
-            effective_take_profit = max(0.01, TAKE_PROFIT_PCT_DEFAULT * 0.8)
-            effective_trailing = max(0.005, TRAILING_STOP_PCT_DEFAULT * 0.8)
+            # LLM/RL controls risk parameters; do not auto-tighten here.
+            pass
 
         # B. Refresh live trades -> positions (live mode)
         if RUN_MODE == "live" and (now - last_trades_fetch) >= LIVE_TRADES_REFRESH_SECONDS:
@@ -1650,6 +1802,7 @@ while True:
 
 
             recent_ohlcv = None
+            recent_closes = None
             candle_patterns = None
             if not df.empty:
                 recent_ohlcv = (
@@ -1657,6 +1810,7 @@ while True:
                     .tail(30)
                     .to_dict(orient="records")
                 )
+                recent_closes = df["close"].tail(30).tolist()
                 candle_patterns = _detect_candle_patterns(df)
                 rsi = ta.momentum.RSIIndicator(df["close"]).rsi().iloc[-1]
                 ema20 = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator().iloc[-1]
@@ -1664,6 +1818,8 @@ while True:
                 vwap = ta.volume.VolumeWeightedAveragePrice(
                     df["high"], df["low"], df["close"], df["volume"]
                 ).volume_weighted_average_price().iloc[-1]
+                avg_vol = None
+                current_vol = None
                 vol_ratio = None
                 try:
                     avg_vol = df["volume"].rolling(window=20).mean().iloc[-1]
@@ -1671,6 +1827,8 @@ while True:
                     if avg_vol and avg_vol > 0:
                         vol_ratio = float(current_vol) / float(avg_vol)
                 except Exception:
+                    avg_vol = None
+                    current_vol = None
                     vol_ratio = None
                 indicators[symbol] = {
                     "rsi": rsi,
@@ -1678,6 +1836,8 @@ while True:
                     "ema20": ema20,
                     "vwap": vwap,
                     "vol_ratio": vol_ratio,
+                    "current_vol": current_vol,
+                    "avg_vol": avg_vol,
                     "atr_pct": (atr/last_price),
                     "last_update": formatted_time
                 }
@@ -1712,32 +1872,66 @@ while True:
                     "drawdown_pct": drawdown_pct,
                     "daily_loss_pct": daily_loss_pct
                 }
-                perf_summary = {
-                    "wins": _win_count,
-                    "losses": _loss_count,
-                    "realized_total": _realized_total,
-                    "win_rate": (win_rate if trade_count else 0.0),
-                    "underperforming": underperforming
-                }
+                ta_context = _build_ta_context(symbol, indicators, recent_ohlcv, candle_patterns)
+                perf_summary = _build_perf_summary(
+                    _win_count,
+                    _loss_count,
+                    _realized_total,
+                    trade_count,
+                    win_rate,
+                    underperforming,
+                    equity
+                )
+                risk_state = _build_risk_state(
+                    equity,
+                    drawdown_pct,
+                    daily_loss_pct,
+                    total_notional,
+                    per_symbol_notional,
+                    open_positions,
+                    effective_min_conf
+                )
+                execution_context = _build_execution_context(symbol, trades_by_symbol, portfolio_context)
+                wallet_state = _build_wallet_state(account_info, trader, equity)
                 llm_result = llm_decision(
                     symbol, last_price, sentiment_score, 0.0, trader.positions,
-                    rsi=indicators[symbol].get("rsi", 50),
-                    ema_20=indicators[symbol].get("ema", last_price),
-                    recent_ohlcv=recent_ohlcv,
-                    candle_patterns=candle_patterns,
+                    rsi=ta_context.get("rsi", 50),
+                    ema_20=ta_context.get("ema_20", last_price),
+                    vwap=ta_context.get("vwap"),
+                    atr_pct=ta_context.get("atr_pct"),
+                    recent_closes=recent_closes,
+                    recent_ohlcv=ta_context.get("recent_ohlcv"),
+                    candle_patterns=ta_context.get("candle_patterns"),
+                    current_vol=ta_context.get("current_vol"),
+                    avg_vol=ta_context.get("avg_vol"),
+                    vol_ratio=ta_context.get("vol_ratio"),
                     perf_summary=perf_summary,
-                    execution_context={
-                        "recent_trades": trades_by_symbol.get(symbol, [])[-5:],
-                        "portfolio": portfolio_context
-                    } if RUN_MODE == "live" else None
+                    execution_context=execution_context if RUN_MODE == "live" else None,
+                    risk_state=risk_state,
+                    wallet_state=wallet_state
                 )
+                latest_llm_symbol = symbol
+                latest_llm_ts = time.strftime("%H:%M:%S")
+                latest_llm_sentiment = sentiment_score
+                latest_llm_ta = ta_context
+                latest_llm_perf = perf_summary
+                latest_llm_risk = risk_state
+                latest_llm_wallet = wallet_state
                 if isinstance(llm_result, dict):
-                    if not llm_result.get("stop_loss_pct"):
-                        llm_result["stop_loss_pct"] = effective_stop_loss
-                    if not llm_result.get("take_profit_pct"):
-                        llm_result["take_profit_pct"] = effective_take_profit
-                    if not llm_result.get("trailing_stop_pct"):
-                        llm_result["trailing_stop_pct"] = effective_trailing
+                    latest_llm_summary = {
+                        "confidence": llm_result.get("confidence"),
+                        "size_fraction": llm_result.get("size_fraction"),
+                        "stop_loss_pct": llm_result.get("stop_loss_pct"),
+                        "take_profit_pct": llm_result.get("take_profit_pct"),
+                        "trailing_stop_pct": llm_result.get("trailing_stop_pct"),
+                        "exit": llm_result.get("exit"),
+                        "order_action": llm_result.get("order_action"),
+                        "reason": llm_result.get("reason"),
+                        "pattern_reason": llm_result.get("pattern_reason")
+                    }
+                else:
+                    latest_llm_summary = {"decision": "no_result"}
+                if isinstance(llm_result, dict):
                     try:
                         if hasattr(trader, "positions") and isinstance(trader.positions, dict):
                             pos = trader.positions.get(symbol) or trader.positions.get(symbol.replace("/", ""))
@@ -1784,40 +1978,6 @@ while True:
                 last_llm_call[symbol] = now
             
             current_llm = llm_outputs.get(symbol, {})
-
-            # Portfolio-aware PnL exits: trim losers when drawdown exceeds threshold
-            if EXECUTION_MODE in ("live", "sim") and drawdown_pct <= -PNL_EXIT_MAX_DRAWDOWN_PCT:
-                pos = trader.positions.get(symbol) if isinstance(trader.positions, dict) else None
-                if pos:
-                    entry = float(pos.get("entry_price", last_price) or last_price)
-                    size = float(pos.get("size", 0.0) or 0.0)
-                    if entry and size:
-                        pnl_pct = (float(last_price) - entry) / entry
-                        if pnl_pct <= PNL_EXIT_LOSER_THRESHOLD_PCT:
-                            action = {
-                                "action": "PLACE_ORDER",
-                                "side": "SELL",
-                                "symbol": symbol.replace("/", ""),
-                                "quantity": size,
-                                "type": "MARKET"
-                            }
-                            if DEBUG_STATUS or DEBUG_LOG_ATTEMPTS:
-                                print(f"[PNL_EXIT] Selling loser {symbol} pnl_pct={pnl_pct:.3f} drawdown={drawdown_pct:.3f}")
-                            try:
-                                v_qty, _ = live_execution_client.validate_order(symbol, size)
-                                action["quantity"] = v_qty
-                                res = execute_llm_action(execution_client, action)
-                                _record_attempt(symbol, "SELL", res.get("status", "SUCCESS"), "PNL_EXIT", qty=v_qty, price=last_price)
-                                _log_order_action(symbol, action, res, mode="pnl_exit", outcome="PNL_EXIT", llm_payload=current_llm, last_price=last_price)
-                                _log_portfolio_snapshot(
-                                    _portfolio_snapshot(trader, prices, account_info, total_notional, per_symbol_notional, equity),
-                                    tag="pnl_exit",
-                                    symbol=symbol
-                                )
-                                continue
-                            except Exception as e:
-                                if DEBUG_STATUS:
-                                    print(f"[PNL_EXIT] Failed {symbol}: {e}")
             
             # D. Execution Routing
             raw_action = current_llm.get("order_action")
@@ -1976,7 +2136,10 @@ while True:
                     _record_attempt(symbol, None, "BLOCKED", "MAX_TRADES_PER_DAY")
                     continue
                 if now < reject_backoff_until.get(symbol, 0.0):
-                    _record_attempt(symbol, None, "BLOCKED", "REJECT_BACKOFF")
+                    last_rej = _reject_backoff_log_state.get(symbol, 0.0)
+                    if (now - last_rej) >= REJECT_BACKOFF_LOG_INTERVAL_SECONDS:
+                        _record_attempt(symbol, None, "BLOCKED", "REJECT_BACKOFF")
+                        _reject_backoff_log_state[symbol] = now
                     continue
                 if EXECUTION_MODE == "live":
                     used_weight = getattr(live_execution_client, "last_used_weight", None)
@@ -2010,15 +2173,6 @@ while True:
                     if DEBUG_LOG_ATTEMPTS:
                         _record_attempt(symbol, None, "SKIPPED", "INVALID_ACTION")
                 if action:
-                    if MAX_SYMBOL_EXPOSURE_PCT > 0 and equity > 0:
-                        sym_key = _to_slash_symbol(symbol)
-                        current_sym_notional = per_symbol_notional.get(sym_key, 0.0)
-                        if current_sym_notional > 0 and (current_sym_notional / equity) >= MAX_SYMBOL_EXPOSURE_PCT:
-                            last_exposure_log = _symbol_exposure_log_state.get(sym_key, 0.0)
-                            if (now - last_exposure_log) >= SYMBOL_EXPOSURE_LOG_INTERVAL_SECONDS:
-                                _record_attempt(symbol, action.get("side"), "BLOCKED", "MAX_SYMBOL_EXPOSURE")
-                                _symbol_exposure_log_state[sym_key] = now
-                            continue
                     try:
                         last_action_attempt[symbol] = now
                         if EXECUTION_MODE == "live":
@@ -2277,7 +2431,53 @@ while True:
             else:
                 orders_payload = getattr(trader, "orders", None)
 
-        prompt_text = list(_llm_action_log)
+        prompt_lines = []
+        if latest_llm_symbol:
+            prompt_lines.append(f"LLM Decision Trace @ {latest_llm_ts} | {latest_llm_symbol}")
+            try:
+                prompt_lines.append(f"Decision: {json.dumps(latest_llm_summary)}")
+            except Exception:
+                prompt_lines.append(f"Decision: {latest_llm_summary}")
+            try:
+                prompt_lines.append(f"Sentiment: {float(latest_llm_sentiment):.3f}")
+            except Exception:
+                prompt_lines.append(f"Sentiment: {latest_llm_sentiment}")
+            try:
+                dd = latest_llm_risk.get("drawdown_pct")
+                max_dd = latest_llm_risk.get("max_drawdown_pct")
+                exp = latest_llm_risk.get("exposure_ratio")
+                opn = latest_llm_risk.get("open_positions")
+                gate = latest_llm_risk.get("confidence_gate")
+                prompt_lines.append(
+                    f"Risk: drawdown={dd:.2%} max_dd={max_dd:.2%} exposure={exp:.2f} open_positions={opn} conf_gate={gate:.2f}"
+                )
+            except Exception:
+                prompt_lines.append(f"Risk: {latest_llm_risk}")
+            try:
+                wins = latest_llm_perf.get("wins")
+                losses = latest_llm_perf.get("losses")
+                wr = latest_llm_perf.get("win_rate")
+                rt = latest_llm_perf.get("realized_total")
+                prompt_lines.append(f"Perf: wins={wins} losses={losses} win_rate={wr:.2%} realized_total={rt}")
+            except Exception:
+                prompt_lines.append(f"Perf: {latest_llm_perf}")
+            try:
+                patterns = ", ".join(latest_llm_ta.get("candle_patterns") or [])
+                prompt_lines.append(
+                    "TA: "
+                    f"RSI={latest_llm_ta.get('rsi')}, "
+                    f"EMA20={latest_llm_ta.get('ema_20')}, "
+                    f"VWAP={latest_llm_ta.get('vwap')}, "
+                    f"ATR%={latest_llm_ta.get('atr_pct')}, "
+                    f"vol_ratio={latest_llm_ta.get('vol_ratio')}, "
+                    f"patterns={patterns or 'none'}"
+                )
+            except Exception:
+                prompt_lines.append(f"TA: {latest_llm_ta}")
+            prompt_lines.append("")
+            prompt_lines.append("Recent LLM actions:")
+        prompt_lines.extend(_llm_action_log[-20:])
+        prompt_text = prompt_lines if prompt_lines else list(_llm_action_log)
         last_rss = get_last_rss_fetch_time()
         rss_active = bool(
             get_rss_active()

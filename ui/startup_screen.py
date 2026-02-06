@@ -2,10 +2,9 @@
 Startup and settings screen.
 
 Responsibilities:
-- Let the user choose mode + trading style
+- Let the user choose mode + exchange
 - Edit config values before boot
 """
-import ast
 import importlib
 import json
 import os
@@ -212,7 +211,7 @@ def run_startup_ui(config_path="config.py"):
     bg_canvas.bind("<Configure>", _resize_card)
 
     ttk.Label(card, text="Ai Trader", style="Panel.Header.TLabel").pack(anchor="w")
-    ttk.Label(card, text="Select your trade preferences to get started", style="Panel.SubHeader.TLabel").pack(anchor="w", pady=(4, 16))
+    ttk.Label(card, text="Select mode and exchange to get started", style="Panel.SubHeader.TLabel").pack(anchor="w", pady=(4, 16))
 
     ttk.Label(card, text="Select trader mode", style="Panel.Section.TLabel").pack(anchor="w")
     mode_var = tk.StringVar(value=getattr(cfg, "RUN_MODE", "live"))
@@ -270,12 +269,8 @@ def run_startup_ui(config_path="config.py"):
     _make_radio(mode_frame, "Sim", "sim")
     _refresh_radios()
 
-    ttk.Label(card, text="Select trading style", style="Panel.Section.TLabel").pack(anchor="w")
-    style_var = tk.StringVar(value=getattr(cfg, "TRADING_STYLE", "balanced"))
-    style_box = ttk.Combobox(card, textvariable=style_var, values=list(getattr(cfg, "STYLE_PRESETS", {}).keys()), state="readonly", font=("Helvetica", 11))
-    style_box.pack(anchor="w", pady=(6, 16))
-    # Match dropdown list font size to the combobox
-    root.option_add("*TCombobox*Listbox.font", ("Helvetica", 11))
+    ttk.Label(card, text="Trading profile", style="Panel.Section.TLabel").pack(anchor="w")
+    tk.Label(card, text="Autopilot (LLM/RL managed)", bg="#000000", fg="#e6e6e6", font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(6, 16))
 
     ttk.Label(card, text="Select exchange", style="Panel.Section.TLabel").pack(anchor="w")
     exchange_var = tk.StringVar(value=getattr(cfg, "EXCHANGE", "binance"))
@@ -304,34 +299,28 @@ def run_startup_ui(config_path="config.py"):
 
     preview_frame = tk.Frame(card, bg="#000000")
     preview_frame.pack(anchor="w", pady=(4, 16), fill=tk.X)
-    preview_title = ttk.Label(preview_frame, text="Style impact preview", style="Panel.Section.TLabel")
+    preview_title = ttk.Label(preview_frame, text="Autopilot baseline", style="Panel.Section.TLabel")
     preview_title.pack(anchor="w")
     preview_body = tk.Label(preview_frame, text="", bg="#000000", fg="#c9d1d9", justify="left", font=("Helvetica", 10))
     preview_body.pack(anchor="w", pady=(4, 0))
-
-    def update_preview(*_):
-        presets = getattr(cfg, "STYLE_PRESETS", {})
-        style_key = style_var.get()
-        data = presets.get(style_key, {})
-        lines = [
-            f"Min confidence: {data.get('min_confidence_to_order', '-')}",
-            f"Size fraction: {data.get('size_fraction', '-')}",
-            f"LLM interval: {data.get('llm_check_interval', '-')}",
-            f"Stop loss: {data.get('stop_loss_pct_default', '-')}",
-            f"Take profit: {data.get('take_profit_pct_default', '-')}",
-            f"Trailing stop: {data.get('trailing_stop_pct_default', '-')}",
-            f"Cooldown (s): {data.get('cooldown_seconds', '-')}",
-            f"Max trades/day: {data.get('max_trades_per_day', '-')}",
-            f"Daily loss limit: {data.get('daily_loss_limit_pct', '-')}",
-            f"Max drawdown: {data.get('max_drawdown_pct', '-')}",
-            f"Max total exposure: {data.get('max_total_exposure_pct', '-')}",
-            f"Max symbol exposure: {data.get('max_symbol_exposure_pct', '-')}",
-            f"Max open positions: {data.get('max_open_positions', '-')}"
-        ]
-        preview_body.config(text="\n".join(lines))
-
-    update_preview()
-    style_box.bind("<<ComboboxSelected>>", update_preview)
+    presets = getattr(cfg, "STYLE_PRESETS", {})
+    data = presets.get("autopilot", {})
+    lines = [
+        f"Min confidence: {data.get('min_confidence_to_order', '-')}",
+        f"Size fraction: {data.get('size_fraction', '-')}",
+        f"LLM interval: {data.get('llm_check_interval', '-')}",
+        f"Stop loss: {data.get('stop_loss_pct_default', '-')}",
+        f"Take profit: {data.get('take_profit_pct_default', '-')}",
+        f"Trailing stop: {data.get('trailing_stop_pct_default', '-')}",
+        f"Cooldown (s): {data.get('cooldown_seconds', '-')}",
+        f"Max trades/day: {data.get('max_trades_per_day', '-')}",
+        f"Daily loss limit: {data.get('daily_loss_limit_pct', '-')}",
+        f"Max drawdown: {data.get('max_drawdown_pct', '-')}",
+        f"Max total exposure: {data.get('max_total_exposure_pct', '-')}",
+        f"Max symbol exposure: {data.get('max_symbol_exposure_pct', '-')}",
+        f"Max open positions: {data.get('max_open_positions', '-')}"
+    ]
+    preview_body.config(text="\n".join(lines))
 
     btn_frame = tk.Frame(card, bg="#000000")
     btn_frame.pack(anchor="w", pady=(10, 0))
@@ -407,68 +396,33 @@ def run_startup_ui(config_path="config.py"):
 
         def add_field(label, key, value):
             ttk.Label(scroll_frame, text=label, style="Section.TLabel").pack(anchor="w", pady=(12, 2))
-            if key == "STYLE_PRESETS":
-                txt = tk.Text(scroll_frame, height=14, width=80, bg="#1a1a1a", fg="#e6e6e6", insertbackground="#e6e6e6")
-                txt.insert("1.0", value)
-                txt.pack(anchor="w", pady=(0, 6))
-                fields[key] = txt
-            else:
-                if isinstance(value, bool):
-                    value = "true" if value else "false"
-                entry = tk.Entry(scroll_frame, width=80, bg="#1a1a1a", fg="#e6e6e6", insertbackground="#e6e6e6")
-                entry.insert(0, value)
-                entry.pack(anchor="w", pady=(0, 6))
-                fields[key] = entry
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            entry = tk.Entry(scroll_frame, width=80, bg="#1a1a1a", fg="#e6e6e6", insertbackground="#e6e6e6")
+            entry.insert(0, value)
+            entry.pack(anchor="w", pady=(0, 6))
+            fields[key] = entry
             if key in doc:
                 ttk.Label(scroll_frame, text=doc[key], style="SubHeader.TLabel").pack(anchor="w")
 
         add_field("RUN_MODE", "RUN_MODE", getattr(cfg, "RUN_MODE", "live"))
         add_field("EXCHANGE", "EXCHANGE", getattr(cfg, "EXCHANGE", "binance"))
-        add_field("TRADING_STYLE", "TRADING_STYLE", getattr(cfg, "TRADING_STYLE", "balanced"))
         add_field("CAPITAL", "CAPITAL", getattr(cfg, "CAPITAL", 10000))
         add_field("USE_LLM", "USE_LLM", getattr(cfg, "USE_LLM", True))
         add_field("MIN_NOTIONAL", "MIN_NOTIONAL", getattr(cfg, "MIN_NOTIONAL", 10.0))
         add_field("KRAKEN_COST_MIN_USD", "KRAKEN_COST_MIN_USD", getattr(cfg, "KRAKEN_COST_MIN_USD", 0.5))
         add_field("ALLOW_MIN_UPSIZE", "ALLOW_MIN_UPSIZE", getattr(cfg, "ALLOW_MIN_UPSIZE", True))
-        add_field("ENABLE_REBALANCE", "ENABLE_REBALANCE", getattr(cfg, "ENABLE_REBALANCE", True))
-        add_field("REBALANCE_SELL_FRACTION", "REBALANCE_SELL_FRACTION", getattr(cfg, "REBALANCE_SELL_FRACTION", 0.25))
-        add_field("REBALANCE_MIN_SCORE_DELTA", "REBALANCE_MIN_SCORE_DELTA", getattr(cfg, "REBALANCE_MIN_SCORE_DELTA", 0.25))
-        add_field("REBALANCE_MIN_HOLD_SECONDS", "REBALANCE_MIN_HOLD_SECONDS", getattr(cfg, "REBALANCE_MIN_HOLD_SECONDS", 600))
-        add_field("REBALANCE_COOLDOWN_SECONDS", "REBALANCE_COOLDOWN_SECONDS", getattr(cfg, "REBALANCE_COOLDOWN_SECONDS", 600))
-        add_field("REBALANCE_PREFER_LOSERS", "REBALANCE_PREFER_LOSERS", getattr(cfg, "REBALANCE_PREFER_LOSERS", True))
-        add_field("REBALANCE_ADVISORY_MODE", "REBALANCE_ADVISORY_MODE", getattr(cfg, "REBALANCE_ADVISORY_MODE", True))
-        add_field("TARGET_ALLOCATION", "TARGET_ALLOCATION", _format_value(getattr(cfg, "TARGET_ALLOCATION", {})))
-        add_field("PNL_EXIT_MAX_DRAWDOWN_PCT", "PNL_EXIT_MAX_DRAWDOWN_PCT", getattr(cfg, "PNL_EXIT_MAX_DRAWDOWN_PCT", 0.08))
-        add_field("PNL_EXIT_LOSER_THRESHOLD_PCT", "PNL_EXIT_LOSER_THRESHOLD_PCT", getattr(cfg, "PNL_EXIT_LOSER_THRESHOLD_PCT", -0.05))
-        add_field("QTY_STEP", "QTY_STEP", getattr(cfg, "QTY_STEP", 0.0001))
         add_field("RESET_SIM_WALLET_ON_START", "RESET_SIM_WALLET_ON_START", getattr(cfg, "RESET_SIM_WALLET_ON_START", False))
         add_field("ACCOUNT_INFO_REFRESH_SECONDS", "ACCOUNT_INFO_REFRESH_SECONDS", getattr(cfg, "ACCOUNT_INFO_REFRESH_SECONDS", 60))
         add_field("LIVE_TRADES_REFRESH_SECONDS", "LIVE_TRADES_REFRESH_SECONDS", getattr(cfg, "LIVE_TRADES_REFRESH_SECONDS", 15))
         add_field("UI_REFRESH_SECONDS", "UI_REFRESH_SECONDS", getattr(cfg, "UI_REFRESH_SECONDS", 1))
-        add_field("DEBUG_STATUS", "DEBUG_STATUS", getattr(cfg, "DEBUG_STATUS", False))
-        add_field("DEBUG_LOG_ATTEMPTS", "DEBUG_LOG_ATTEMPTS", getattr(cfg, "DEBUG_LOG_ATTEMPTS", False))
-        add_field("RESET_DAILY_RISK_ON_START", "RESET_DAILY_RISK_ON_START", getattr(cfg, "RESET_DAILY_RISK_ON_START", True))
-        add_field("STALE_PRICE_SECONDS", "STALE_PRICE_SECONDS", getattr(cfg, "STALE_PRICE_SECONDS", 15))
-        add_field("STALE_WARN_INTERVAL_SECONDS", "STALE_WARN_INTERVAL_SECONDS", getattr(cfg, "STALE_WARN_INTERVAL_SECONDS", 60))
-        add_field("STALE_GRACE_SECONDS", "STALE_GRACE_SECONDS", getattr(cfg, "STALE_GRACE_SECONDS", 20))
-        add_field("ORDER_RETRY_SECONDS", "ORDER_RETRY_SECONDS", getattr(cfg, "ORDER_RETRY_SECONDS", 30))
-        add_field("BLOCK_ON_STALE_PRICE", "BLOCK_ON_STALE_PRICE", getattr(cfg, "BLOCK_ON_STALE_PRICE", True))
-        add_field("REJECT_BACKOFF_SECONDS", "REJECT_BACKOFF_SECONDS", getattr(cfg, "REJECT_BACKOFF_SECONDS", 60))
-        add_field("MAX_API_WEIGHT_1M", "MAX_API_WEIGHT_1M", getattr(cfg, "MAX_API_WEIGHT_1M", 1000))
-        add_field("MAX_API_WEIGHT_1M_KRAKEN", "MAX_API_WEIGHT_1M_KRAKEN", getattr(cfg, "MAX_API_WEIGHT_1M_KRAKEN", 120))
-        add_field("MAX_ORDER_COUNT_10S", "MAX_ORDER_COUNT_10S", getattr(cfg, "MAX_ORDER_COUNT_10S", 8))
-        add_field("ATTEMPT_LOG_COOLDOWN_SECONDS", "ATTEMPT_LOG_COOLDOWN_SECONDS", getattr(cfg, "ATTEMPT_LOG_COOLDOWN_SECONDS", 20))
-        add_field("ATTEMPT_LOG_DEDUP_BY_REASON", "ATTEMPT_LOG_DEDUP_BY_REASON", getattr(cfg, "ATTEMPT_LOG_DEDUP_BY_REASON", True))
         add_field("SYMBOLS", "SYMBOLS", ", ".join(getattr(cfg, "SYMBOLS", [])))
         add_field("TIMEFRAME", "TIMEFRAME", getattr(cfg, "TIMEFRAME", "5m"))
         add_field("LLM_CHECK_INTERVAL", "LLM_CHECK_INTERVAL", getattr(cfg, "LLM_CHECK_INTERVAL", 300))
-        add_field("DAILY_LOSS_LIMIT_PCT", "DAILY_LOSS_LIMIT_PCT", getattr(cfg, "DAILY_LOSS_LIMIT_PCT", 0.02))
-        add_field("MAX_DRAWDOWN_PCT", "MAX_DRAWDOWN_PCT", getattr(cfg, "MAX_DRAWDOWN_PCT", 0.05))
-        add_field("MAX_TOTAL_EXPOSURE_PCT", "MAX_TOTAL_EXPOSURE_PCT", getattr(cfg, "MAX_TOTAL_EXPOSURE_PCT", 0.5))
-        add_field("MIN_EXPOSURE_RESUME_PCT", "MIN_EXPOSURE_RESUME_PCT", getattr(cfg, "MIN_EXPOSURE_RESUME_PCT", 0.2))
-        add_field("MAX_SYMBOL_EXPOSURE_PCT", "MAX_SYMBOL_EXPOSURE_PCT", getattr(cfg, "MAX_SYMBOL_EXPOSURE_PCT", 0.2))
-        add_field("MAX_OPEN_POSITIONS", "MAX_OPEN_POSITIONS", getattr(cfg, "MAX_OPEN_POSITIONS", 3))
-        add_field("STYLE_PRESETS", "STYLE_PRESETS", _format_value(getattr(cfg, "STYLE_PRESETS", {})))
+        add_field("STALE_PRICE_SECONDS", "STALE_PRICE_SECONDS", getattr(cfg, "STALE_PRICE_SECONDS", 15))
+        add_field("STALE_WARN_INTERVAL_SECONDS", "STALE_WARN_INTERVAL_SECONDS", getattr(cfg, "STALE_WARN_INTERVAL_SECONDS", 60))
+        add_field("STALE_GRACE_SECONDS", "STALE_GRACE_SECONDS", getattr(cfg, "STALE_GRACE_SECONDS", 20))
+        add_field("BLOCK_ON_STALE_PRICE", "BLOCK_ON_STALE_PRICE", getattr(cfg, "BLOCK_ON_STALE_PRICE", True))
 
         ttk.Label(scroll_frame, text="API Keys", style="Section.TLabel").pack(anchor="w", pady=(16, 6))
         key_frame = tk.Frame(scroll_frame, bg="#000000")
@@ -506,58 +460,24 @@ def run_startup_ui(config_path="config.py"):
             updates = {
                 "RUN_MODE": fields["RUN_MODE"].get(),
                 "EXCHANGE": fields["EXCHANGE"].get(),
-                "TRADING_STYLE": fields["TRADING_STYLE"].get(),
+                "TRADING_STYLE": "autopilot",
                 "CAPITAL": fields["CAPITAL"].get(),
                 "USE_LLM": fields["USE_LLM"].get(),
                 "MIN_NOTIONAL": fields["MIN_NOTIONAL"].get(),
                 "KRAKEN_COST_MIN_USD": fields["KRAKEN_COST_MIN_USD"].get(),
                 "ALLOW_MIN_UPSIZE": fields["ALLOW_MIN_UPSIZE"].get(),
-                "ENABLE_REBALANCE": fields["ENABLE_REBALANCE"].get(),
-                "REBALANCE_SELL_FRACTION": fields["REBALANCE_SELL_FRACTION"].get(),
-                "REBALANCE_MIN_SCORE_DELTA": fields["REBALANCE_MIN_SCORE_DELTA"].get(),
-                "REBALANCE_MIN_HOLD_SECONDS": fields["REBALANCE_MIN_HOLD_SECONDS"].get(),
-                "REBALANCE_COOLDOWN_SECONDS": fields["REBALANCE_COOLDOWN_SECONDS"].get(),
-                "REBALANCE_PREFER_LOSERS": fields["REBALANCE_PREFER_LOSERS"].get(),
-                "REBALANCE_ADVISORY_MODE": fields["REBALANCE_ADVISORY_MODE"].get(),
-                "TARGET_ALLOCATION": fields["TARGET_ALLOCATION"].get(),
-                "PNL_EXIT_MAX_DRAWDOWN_PCT": fields["PNL_EXIT_MAX_DRAWDOWN_PCT"].get(),
-                "PNL_EXIT_LOSER_THRESHOLD_PCT": fields["PNL_EXIT_LOSER_THRESHOLD_PCT"].get(),
-                "QTY_STEP": fields["QTY_STEP"].get(),
                 "RESET_SIM_WALLET_ON_START": fields["RESET_SIM_WALLET_ON_START"].get(),
                 "ACCOUNT_INFO_REFRESH_SECONDS": fields["ACCOUNT_INFO_REFRESH_SECONDS"].get(),
                 "LIVE_TRADES_REFRESH_SECONDS": fields["LIVE_TRADES_REFRESH_SECONDS"].get(),
                 "UI_REFRESH_SECONDS": fields["UI_REFRESH_SECONDS"].get(),
-                "DEBUG_STATUS": fields["DEBUG_STATUS"].get(),
-                "DEBUG_LOG_ATTEMPTS": fields["DEBUG_LOG_ATTEMPTS"].get(),
-                "RESET_DAILY_RISK_ON_START": fields["RESET_DAILY_RISK_ON_START"].get(),
                 "STALE_PRICE_SECONDS": fields["STALE_PRICE_SECONDS"].get(),
                 "STALE_WARN_INTERVAL_SECONDS": fields["STALE_WARN_INTERVAL_SECONDS"].get(),
                 "STALE_GRACE_SECONDS": fields["STALE_GRACE_SECONDS"].get(),
-                "ORDER_RETRY_SECONDS": fields["ORDER_RETRY_SECONDS"].get(),
                 "BLOCK_ON_STALE_PRICE": fields["BLOCK_ON_STALE_PRICE"].get(),
-                "REJECT_BACKOFF_SECONDS": fields["REJECT_BACKOFF_SECONDS"].get(),
-                "MAX_API_WEIGHT_1M": fields["MAX_API_WEIGHT_1M"].get(),
-                "MAX_API_WEIGHT_1M_KRAKEN": fields["MAX_API_WEIGHT_1M_KRAKEN"].get(),
-                "MAX_ORDER_COUNT_10S": fields["MAX_ORDER_COUNT_10S"].get(),
-                "ATTEMPT_LOG_COOLDOWN_SECONDS": fields["ATTEMPT_LOG_COOLDOWN_SECONDS"].get(),
-                "ATTEMPT_LOG_DEDUP_BY_REASON": fields["ATTEMPT_LOG_DEDUP_BY_REASON"].get(),
                 "SYMBOLS": fields["SYMBOLS"].get(),
                 "TIMEFRAME": fields["TIMEFRAME"].get(),
-                "LLM_CHECK_INTERVAL": fields["LLM_CHECK_INTERVAL"].get(),
-                "DAILY_LOSS_LIMIT_PCT": fields["DAILY_LOSS_LIMIT_PCT"].get(),
-                "MAX_DRAWDOWN_PCT": fields["MAX_DRAWDOWN_PCT"].get(),
-                "MAX_TOTAL_EXPOSURE_PCT": fields["MAX_TOTAL_EXPOSURE_PCT"].get(),
-                "MIN_EXPOSURE_RESUME_PCT": fields["MIN_EXPOSURE_RESUME_PCT"].get(),
-                "MAX_SYMBOL_EXPOSURE_PCT": fields["MAX_SYMBOL_EXPOSURE_PCT"].get(),
-                "MAX_OPEN_POSITIONS": fields["MAX_OPEN_POSITIONS"].get()
+                "LLM_CHECK_INTERVAL": fields["LLM_CHECK_INTERVAL"].get()
             }
-
-            style_text = fields["STYLE_PRESETS"].get("1.0", tk.END)
-            try:
-                ast.literal_eval(style_text.split("=", 1)[-1].strip())
-            except Exception:
-                _show_toast(settings, "STYLE_PRESETS must be valid Python dict syntax.")
-                return
 
             try:
                 updates["CAPITAL"] = float(updates["CAPITAL"])
@@ -565,48 +485,21 @@ def run_startup_ui(config_path="config.py"):
                 updates["MIN_NOTIONAL"] = float(updates["MIN_NOTIONAL"])
                 updates["KRAKEN_COST_MIN_USD"] = float(updates["KRAKEN_COST_MIN_USD"])
                 updates["ALLOW_MIN_UPSIZE"] = str(updates["ALLOW_MIN_UPSIZE"]).lower() in ("true", "1", "yes", "y")
-                updates["ENABLE_REBALANCE"] = str(updates["ENABLE_REBALANCE"]).lower() in ("true", "1", "yes", "y")
-                updates["REBALANCE_SELL_FRACTION"] = float(updates["REBALANCE_SELL_FRACTION"])
-                updates["REBALANCE_MIN_SCORE_DELTA"] = float(updates["REBALANCE_MIN_SCORE_DELTA"])
-                updates["REBALANCE_MIN_HOLD_SECONDS"] = int(updates["REBALANCE_MIN_HOLD_SECONDS"])
-                updates["REBALANCE_COOLDOWN_SECONDS"] = int(updates["REBALANCE_COOLDOWN_SECONDS"])
-                updates["REBALANCE_PREFER_LOSERS"] = str(updates["REBALANCE_PREFER_LOSERS"]).lower() in ("true", "1", "yes", "y")
-                updates["REBALANCE_ADVISORY_MODE"] = str(updates["REBALANCE_ADVISORY_MODE"]).lower() in ("true", "1", "yes", "y")
-                updates["TARGET_ALLOCATION"] = ast.literal_eval(updates["TARGET_ALLOCATION"])
-                updates["PNL_EXIT_MAX_DRAWDOWN_PCT"] = float(updates["PNL_EXIT_MAX_DRAWDOWN_PCT"])
-                updates["PNL_EXIT_LOSER_THRESHOLD_PCT"] = float(updates["PNL_EXIT_LOSER_THRESHOLD_PCT"])
-                updates["QTY_STEP"] = float(updates["QTY_STEP"])
                 updates["RESET_SIM_WALLET_ON_START"] = str(updates["RESET_SIM_WALLET_ON_START"]).lower() in ("true", "1", "yes", "y")
                 updates["ACCOUNT_INFO_REFRESH_SECONDS"] = int(updates["ACCOUNT_INFO_REFRESH_SECONDS"])
                 updates["LIVE_TRADES_REFRESH_SECONDS"] = int(updates["LIVE_TRADES_REFRESH_SECONDS"])
                 updates["UI_REFRESH_SECONDS"] = int(updates["UI_REFRESH_SECONDS"])
-                updates["DEBUG_STATUS"] = str(updates["DEBUG_STATUS"]).lower() in ("true", "1", "yes", "y")
-                updates["DEBUG_LOG_ATTEMPTS"] = str(updates["DEBUG_LOG_ATTEMPTS"]).lower() in ("true", "1", "yes", "y")
-                updates["RESET_DAILY_RISK_ON_START"] = str(updates["RESET_DAILY_RISK_ON_START"]).lower() in ("true", "1", "yes", "y")
                 updates["STALE_PRICE_SECONDS"] = int(updates["STALE_PRICE_SECONDS"])
                 updates["STALE_WARN_INTERVAL_SECONDS"] = int(updates["STALE_WARN_INTERVAL_SECONDS"])
                 updates["STALE_GRACE_SECONDS"] = int(updates["STALE_GRACE_SECONDS"])
-                updates["ORDER_RETRY_SECONDS"] = int(updates["ORDER_RETRY_SECONDS"])
                 updates["BLOCK_ON_STALE_PRICE"] = str(updates["BLOCK_ON_STALE_PRICE"]).lower() in ("true", "1", "yes", "y")
-                updates["REJECT_BACKOFF_SECONDS"] = int(updates["REJECT_BACKOFF_SECONDS"])
-                updates["MAX_API_WEIGHT_1M"] = int(updates["MAX_API_WEIGHT_1M"])
-                updates["MAX_API_WEIGHT_1M_KRAKEN"] = int(updates["MAX_API_WEIGHT_1M_KRAKEN"])
-                updates["MAX_ORDER_COUNT_10S"] = int(updates["MAX_ORDER_COUNT_10S"])
-                updates["ATTEMPT_LOG_COOLDOWN_SECONDS"] = int(updates["ATTEMPT_LOG_COOLDOWN_SECONDS"])
-                updates["ATTEMPT_LOG_DEDUP_BY_REASON"] = str(updates["ATTEMPT_LOG_DEDUP_BY_REASON"]).lower() in ("true", "1", "yes", "y")
                 updates["SYMBOLS"] = _parse_symbols(updates["SYMBOLS"])
                 updates["LLM_CHECK_INTERVAL"] = int(updates["LLM_CHECK_INTERVAL"])
-                updates["DAILY_LOSS_LIMIT_PCT"] = float(updates["DAILY_LOSS_LIMIT_PCT"])
-                updates["MAX_DRAWDOWN_PCT"] = float(updates["MAX_DRAWDOWN_PCT"])
-                updates["MAX_TOTAL_EXPOSURE_PCT"] = float(updates["MAX_TOTAL_EXPOSURE_PCT"])
-                updates["MIN_EXPOSURE_RESUME_PCT"] = float(updates["MIN_EXPOSURE_RESUME_PCT"])
-                updates["MAX_SYMBOL_EXPOSURE_PCT"] = float(updates["MAX_SYMBOL_EXPOSURE_PCT"])
-                updates["MAX_OPEN_POSITIONS"] = int(updates["MAX_OPEN_POSITIONS"])
             except Exception:
                 _show_toast(settings, "Invalid value type. Please check numeric and boolean fields.")
                 return
 
-            _update_config_file(config_path, updates, style_text)
+            _update_config_file(config_path, updates, None)
             _show_toast(settings, "Settings saved.", kind="success")
             settings.destroy()
 
@@ -627,12 +520,9 @@ def run_startup_ui(config_path="config.py"):
     def start_bot():
         updates = {
             "RUN_MODE": mode_var.get(),
-            "TRADING_STYLE": style_var.get(),
+            "TRADING_STYLE": "autopilot",
             "EXCHANGE": exchange_var.get()
         }
-        if updates["TRADING_STYLE"] not in getattr(cfg, "STYLE_PRESETS", {}):
-            _show_toast(root, "Please select a valid trading style.")
-            return
         _update_config_file(config_path, updates, None)
         root.destroy()
 

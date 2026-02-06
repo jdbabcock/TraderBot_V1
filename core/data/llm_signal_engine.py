@@ -385,6 +385,26 @@ def llm_decision(
         recent_ohlcv_str = json.dumps(recent_ohlcv[-20:]) if recent_ohlcv else "N/A"
         candle_patterns_str = ", ".join(candle_patterns) if candle_patterns else "none"
 
+        win_loss_line = "N/A"
+        if perf_summary:
+            try:
+                wins = perf_summary.get("wins")
+                losses = perf_summary.get("losses")
+                win_rate = perf_summary.get("win_rate")
+                win_loss_line = f"{wins}/{losses} (win_rate={win_rate:.2%})"
+            except Exception:
+                win_loss_line = json.dumps(perf_summary)
+
+        risk_overview = "N/A"
+        if risk_state:
+            try:
+                dd = risk_state.get("drawdown_pct")
+                exp = risk_state.get("exposure_ratio")
+                open_pos = risk_state.get("open_positions")
+                risk_overview = f"drawdown={dd:.2%} exposure={exp:.2f} open_positions={open_pos}"
+            except Exception:
+                risk_overview = json.dumps(risk_state)
+
         prompt = (
             "You are an expert crypto trading assistant. "
             "Make profitable trades while managing risk.\n\n"
@@ -393,6 +413,8 @@ def llm_decision(
             f"Recent closes: [{recent_prices_str}]\n"
             f"Price velocity (% change): {velocity:.2f}\n"
             f"Sentiment score (-1 to 1, contrarian-adjusted at extremes): {sentiment:.2f}\n"
+            f"Win/Loss: {win_loss_line}\n"
+            f"Risk overview: {risk_overview}\n"
             f"Current open positions: {json.dumps(positions)}\n"
             f"Technical price score (0–1, bullish): {price_score:.2f}\n"
             f"RSI: {rsi}\nEMA-20: {ema_20}\nVWAP: {vwap}\n"
@@ -406,7 +428,8 @@ def llm_decision(
             f"Wallet state: {json.dumps(wallet_state) if wallet_state else 'N/A'}\n"
             f"Execution context: {json.dumps(execution_context) if execution_context else 'N/A'}\n"
             f"Risk state: {json.dumps(risk_state) if risk_state else 'N/A'}\n"
-            "If confidence >= 0.4 and exit is false, include a concrete order_action.\n"
+            "You may adjust size_fraction, stop_loss_pct, take_profit_pct, and trailing_stop_pct based on the context.\n"
+            "Only include order_action when you truly want to trade; confidence is informational and there is no external confidence filter.\n"
             "Return ONLY a JSON object with keys:\n"
             "confidence (0–1), size_fraction (0–1), stop_loss_pct, take_profit_pct, trailing_stop_pct, exit (bool), reason (short string), "
             "pattern_reason (short string explaining any candle pattern usage), order_action (object or null), fill_rate_scale (0.5-2.0), "

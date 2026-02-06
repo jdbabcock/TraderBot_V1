@@ -119,7 +119,7 @@ MIN_EXPOSURE_RESUME_PCT = 0.2
 MAX_SYMBOL_EXPOSURE_PCT = 0.2
 MAX_OPEN_POSITIONS = 3
 
-# Style presets (override in main.py by TRADING_STYLE)
+# Style presets (autopilot only)
 # Notes:
 # - min_confidence_to_order: minimum LLM confidence to place a trade
 # - size_fraction: fraction of capital per trade (risk sizing)
@@ -130,7 +130,25 @@ MAX_OPEN_POSITIONS = 3
 # - symbol_cooldown_seconds: minimum time between trades per symbol
 # - max_trades_per_day: hard cap on daily trades
 # BEGIN STYLE_PRESETS
-STYLE_PRESETS = {"conservative": {"min_confidence_to_order": 0.6, "size_fraction": 0.05, "llm_check_interval": 300, "stop_loss_pct_default": 0.008, "take_profit_pct_default": 0.015, "trailing_stop_pct_default": 0.01, "cooldown_seconds": 0, "symbol_cooldown_seconds": 60, "max_trades_per_day": 10, "daily_loss_limit_pct": 0.01, "max_drawdown_pct": 0.03, "max_total_exposure_pct": 0.6, "min_exposure_resume_pct": 0.1, "max_symbol_exposure_pct": 0.12, "max_open_positions": 3}, "balanced": {"min_confidence_to_order": 0.4, "size_fraction": 0.1, "llm_check_interval": 120, "stop_loss_pct_default": 0.01, "take_profit_pct_default": 0.02, "trailing_stop_pct_default": 0.015, "cooldown_seconds": 0, "symbol_cooldown_seconds": 60, "max_trades_per_day": 999, "daily_loss_limit_pct": 0.02, "max_drawdown_pct": 0.05, "max_total_exposure_pct": 0.8, "min_exposure_resume_pct": 0.4, "max_symbol_exposure_pct": 0.2, "max_open_positions": 6}, "aggressive": {"min_confidence_to_order": 0.25, "size_fraction": 0.2, "llm_check_interval": 60, "stop_loss_pct_default": 0.015, "take_profit_pct_default": 0.03, "trailing_stop_pct_default": 0.02, "cooldown_seconds": 0, "symbol_cooldown_seconds": 60, "max_trades_per_day": 999, "daily_loss_limit_pct": 0.04, "max_drawdown_pct": 0.08, "max_total_exposure_pct": 0.9, "min_exposure_resume_pct": 0.5, "max_symbol_exposure_pct": 0.3, "max_open_positions": 10}, "autopilot": {"min_confidence_to_order": 0.35, "size_fraction": 0.1, "llm_check_interval": 120, "stop_loss_pct_default": 0.01, "take_profit_pct_default": 0.02, "trailing_stop_pct_default": 0.015, "cooldown_seconds": 0, "symbol_cooldown_seconds": 60, "max_trades_per_day": 999, "daily_loss_limit_pct": 0.02, "max_drawdown_pct": 0.05, "max_total_exposure_pct": 0.8, "min_exposure_resume_pct": 0.4, "max_symbol_exposure_pct": 0.2, "max_open_positions": 6}, "degen": {"min_confidence_to_order": 0.15, "size_fraction": 0.35, "llm_check_interval": 30, "stop_loss_pct_default": 0.2, "take_profit_pct_default": 0.05, "trailing_stop_pct_default": 0.03, "cooldown_seconds": 0, "symbol_cooldown_seconds": 0, "max_trades_per_day": 9999, "daily_loss_limit_pct": 0.2, "max_drawdown_pct": 0.5, "max_total_exposure_pct": 1.0, "min_exposure_resume_pct": 0.6, "max_symbol_exposure_pct": 0.5, "max_open_positions": 20}}
+STYLE_PRESETS = {
+    "autopilot": {
+        "min_confidence_to_order": 0.10,
+        "size_fraction": 0.1,
+        "llm_check_interval": 120,
+        "stop_loss_pct_default": 0.01,
+        "take_profit_pct_default": 0.02,
+        "trailing_stop_pct_default": 0.015,
+        "cooldown_seconds": 0,
+        "symbol_cooldown_seconds": 0,
+        "max_trades_per_day": 999,
+        "daily_loss_limit_pct": 0.02,
+        "max_drawdown_pct": 0.5,
+        "max_total_exposure_pct": 1.0,
+        "min_exposure_resume_pct": 0.4,
+        "max_symbol_exposure_pct": 0.5,
+        "max_open_positions": 6
+    }
+}
 # END STYLE_PRESETS
 
 # Optional UI descriptions (used by the startup/settings screen)
