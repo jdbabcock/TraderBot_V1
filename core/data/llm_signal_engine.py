@@ -464,6 +464,18 @@ def llm_decision(
             except Exception:
                 risk_overview = json.dumps(risk_state)
 
+        fee_overview = "N/A"
+        if execution_context and isinstance(execution_context, dict):
+            fee_model = execution_context.get("fee_model")
+            if isinstance(fee_model, dict):
+                try:
+                    maker = float(fee_model.get("maker_pct", 0.0))
+                    taker = float(fee_model.get("taker_pct", 0.0))
+                    slippage = float(fee_model.get("slippage_pct", 0.0))
+                    fee_overview = f"maker={maker:.3%} taker={taker:.3%} slippage_est={slippage:.3%}"
+                except Exception:
+                    fee_overview = json.dumps(fee_model)
+
         prompt = (
             "You are an expert crypto trading assistant. "
             "Make profitable trades while managing risk.\n\n"
@@ -474,6 +486,7 @@ def llm_decision(
             f"Sentiment score (-1 to 1, contrarian-adjusted at extremes): {sentiment:.2f}\n"
             f"Win/Loss: {win_loss_line}\n"
             f"Risk overview: {risk_overview}\n"
+            f"Estimated fees/slippage: {fee_overview}\n"
             f"Current open positions: {json.dumps(positions)}\n"
             f"Technical price score (0–1, bullish): {price_score:.2f}\n"
             f"RSI: {rsi}\nEMA-20: {ema_20}\nVWAP: {vwap}\n"
@@ -488,6 +501,10 @@ def llm_decision(
             f"Execution context: {json.dumps(execution_context) if execution_context else 'N/A'}\n"
             f"Risk state: {json.dumps(risk_state) if risk_state else 'N/A'}\n"
             "You may adjust size_fraction, stop_loss_pct, take_profit_pct, and trailing_stop_pct based on the context.\n"
+            "Only enter trades when expected profit clears estimated fees and slippage; avoid low-edge scalps.\n"
+            "Prefer LIMIT orders for entries and planned exits; include a limit price. "
+            "Use MARKET orders only for urgent exits or extreme volatility. "
+            "When providing order_action, include type (LIMIT or MARKET) and price for LIMIT.\n"
             "Provide price_prediction (target price), prediction_horizon_min (minutes), and conviction (0-1). "
             "Also include predictions as a list for horizons 60m, 1440m (1d), and 10080m (1w). "
             "Use conviction to justify holding through temporary drawdowns with wider stops.\n"

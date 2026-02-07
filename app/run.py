@@ -302,6 +302,9 @@ MAX_API_WEIGHT_1M_KRAKEN = int(getattr(bot_config, "MAX_API_WEIGHT_1M_KRAKEN", 1
 MAX_ORDER_COUNT_10S = int(getattr(bot_config, "MAX_ORDER_COUNT_10S", 8)) if bot_config else 8
 ATTEMPT_LOG_COOLDOWN_SECONDS = int(getattr(bot_config, "ATTEMPT_LOG_COOLDOWN_SECONDS", 20)) if bot_config else 20
 ATTEMPT_LOG_DEDUP_BY_REASON = bool(getattr(bot_config, "ATTEMPT_LOG_DEDUP_BY_REASON", True)) if bot_config else True
+KRAKEN_MAKER_FEE_PCT = float(getattr(bot_config, "KRAKEN_MAKER_FEE_PCT", 0.0025)) if bot_config else 0.0025
+KRAKEN_TAKER_FEE_PCT = float(getattr(bot_config, "KRAKEN_TAKER_FEE_PCT", 0.004)) if bot_config else 0.004
+ESTIMATED_SLIPPAGE_PCT = float(getattr(bot_config, "ESTIMATED_SLIPPAGE_PCT", 0.0075)) if bot_config else 0.0075
 STYLE_PRESETS = getattr(bot_config, "STYLE_PRESETS", {}) if bot_config else {}
 DAILY_LOSS_LIMIT_PCT = float(getattr(bot_config, "DAILY_LOSS_LIMIT_PCT", 0.02)) if bot_config else 0.02
 MAX_DRAWDOWN_PCT = float(getattr(bot_config, "MAX_DRAWDOWN_PCT", 0.05)) if bot_config else 0.05
@@ -577,6 +580,7 @@ def _normalize_action(action, symbol, last_price, trader, size_frac, perf_score)
     
     act_name = str(action.get("action", "")).strip().upper()
     side = str(action.get("side", "")).strip().upper()
+    order_type = str(action.get("type") or action.get("order_type") or "").strip().upper()
     if not act_name and not side:
         type_hint = str(action.get("type", "")).strip().upper()
         if type_hint in ("BUY", "SELL"):
@@ -606,14 +610,21 @@ def _normalize_action(action, symbol, last_price, trader, size_frac, perf_score)
             
     if not qty or qty <= 0: return None, "None"
     
+    if order_type not in ("LIMIT", "MARKET"):
+        order_type = "MARKET"
     action.update({
-        "action": act_name, 
-        "side": side, 
-        "symbol": symbol.replace("/", ""), 
-        "quantity": qty, 
-        "type": "MARKET"
+        "action": act_name,
+        "side": side,
+        "symbol": symbol.replace("/", ""),
+        "quantity": qty,
+        "type": order_type
     })
-    return action, f"{act_name} {side} {symbol} qty={qty:.4f}"
+    if order_type == "LIMIT" and action.get("price") in (None, "", "None") and last_price:
+        action["price"] = float(last_price)
+    summary = f"{act_name} {side} {symbol} qty={qty:.4f}"
+    if action.get("type") == "LIMIT" and action.get("price"):
+        summary += f" price={action.get('price')}"
+    return action, summary
 
 def _estimate_realized_pnl(symbol, qty, price, trader):
     try:
@@ -633,23 +644,90 @@ def _estimate_realized_pnl(symbol, qty, price, trader):
     except Exception:
         return None
 
-def _record_win_loss(realized_pnl, symbol=None):
-    global _win_count, _loss_count, _realized_total
+def _fee_rate_for_order(order_type):
+    if EXCHANGE != "kraken":
+        return 0.0
+    t = str(order_type or "").upper()
+    if t == "LIMIT":
+        return KRAKEN_MAKER_FEE_PCT
+    return KRAKEN_TAKER_FEE_PCT
+
+def _get_entry_info(symbol):
+    norm = _to_slash_symbol(symbol)
+    tracker = _trade_trackers.get(norm) or _trade_trackers.get(symbol)
+    entry_price = None
+    entry_order_type = None
+    if tracker:
+        entry_price = tracker.get("entry_price")
+        entry_order_type = tracker.get("entry_order_type")
+    if entry_price is None and hasattr(trader, "positions") and isinstance(trader.positions, dict):
+        pos = trader.positions.get(norm) or trader.positions.get(symbol)
+        if isinstance(pos, dict):
+            entry_price = pos.get("entry_price") or pos.get("fill_price")
+            entry_order_type = pos.get("entry_order_type")
+    try:
+        entry_price = float(entry_price) if entry_price is not None else None
+    except Exception:
+        entry_price = None
+    return entry_price, entry_order_type
+
+def _estimate_round_trip_costs(symbol, qty, exit_price, exit_order_type=None, entry_price=None, entry_order_type=None):
+    try:
+        qty = float(qty)
+        exit_price = float(exit_price)
+        if qty <= 0 or exit_price <= 0:
+            return None, None
+        if entry_price is None:
+            entry_price, entry_order_type = _get_entry_info(symbol)
+        if entry_price is None or entry_price <= 0:
+            return None, None
+        entry_notional = entry_price * qty
+        exit_notional = exit_price * qty
+        fee_total = (
+            entry_notional * _fee_rate_for_order(entry_order_type)
+            + exit_notional * _fee_rate_for_order(exit_order_type)
+        )
+        slippage_est = (entry_notional + exit_notional) * ESTIMATED_SLIPPAGE_PCT
+        return fee_total, slippage_est
+    except Exception:
+        return None, None
+
+
+def _record_win_loss(realized_pnl, symbol=None, realized_pnl_net=None, fee_total=None):
+    global _win_count, _loss_count, _realized_total, _realized_total_gross, _realized_total_fees
     if realized_pnl is None:
         return
     try:
-        pnl_val = float(realized_pnl)
+        gross_val = float(realized_pnl)
     except Exception:
         return
+    fee_val = 0.0
+    if fee_total is not None:
+        try:
+            fee_val = float(fee_total)
+        except Exception:
+            fee_val = 0.0
+    if realized_pnl_net is None:
+        pnl_val = gross_val - fee_val
+    else:
+        try:
+            pnl_val = float(realized_pnl_net)
+        except Exception:
+            pnl_val = gross_val - fee_val
     _realized_total += pnl_val
+    _realized_total_gross += gross_val
+    _realized_total_fees += fee_val
     if pnl_val > 0:
         _win_count += 1
     elif pnl_val < 0:
         _loss_count += 1
-    print(f"[TRADE_CLOSE] {symbol or ''} realized_pnl={pnl_val:.4f} wins={_win_count} losses={_loss_count} total_realized={_realized_total:.4f}")
+    print(
+        f"[TRADE_CLOSE] {symbol or ''} gross={gross_val:.4f} fees={fee_val:.4f} net={pnl_val:.4f} "
+        f"wins={_win_count} losses={_loss_count} total_realized={_realized_total:.4f}"
+    )
 
 def _load_perf_guard_history():
-    global _win_count, _loss_count, _realized_total, _autopilot_trade_pnls
+    global _win_count, _loss_count, _realized_total, _realized_total_gross, _realized_total_fees, _autopilot_trade_pnls
     if not PERF_GUARD_PERSIST or PERF_GUARD_MODE.lower() == "session":
         return
     state_total = None
@@ -666,7 +744,9 @@ def _load_perf_guard_history():
     trade_pnls = None
     trade_wins = 0
     trade_losses = 0
-    trade_total = 0.0
+    trade_total_net = 0.0
+    trade_total_gross = 0.0
+    trade_total_fees = 0.0
     if os.path.exists(trades_csv):
         try:
             per_symbol = {}
@@ -702,11 +782,16 @@ def _load_perf_guard_history():
                         realized = (t_price - avg_cost) * reduce_qty
                         cost -= avg_cost * reduce_qty
                         qty -= reduce_qty
-                        trade_total += realized
-                        pnl_list.append(realized)
-                        if realized > 0:
+                        fee_rate = KRAKEN_TAKER_FEE_PCT if EXCHANGE == "kraken" else 0.0
+                        fee_est = (avg_cost * reduce_qty + t_price * reduce_qty) * fee_rate
+                        realized_net = realized - fee_est
+                        trade_total_net += realized_net
+                        trade_total_gross += realized
+                        trade_total_fees += fee_est
+                        pnl_list.append(realized_net)
+                        if realized_net > 0:
                             trade_wins += 1
-                        elif realized < 0:
+                        elif realized_net < 0:
                             trade_losses += 1
             if pnl_list:
                 trade_pnls = pnl_list
@@ -717,17 +802,23 @@ def _load_perf_guard_history():
             trade_pnls = None
 
     if trade_pnls:
-        _realized_total = state_total if state_total is not None else trade_total
         if state_total is not None:
-            print(f"[PERF_GUARD] Loaded {len(trade_pnls)} trades from live_trades.csv (wins={trade_wins} losses={trade_losses} realized_total={_realized_total:.2f})")
+            _realized_total = state_total
+            _realized_total_gross = state_total
+            _realized_total_fees = 0.0
         else:
-            print(f"[PERF_GUARD] Loaded {len(trade_pnls)} trades from live_trades.csv (wins={trade_wins} losses={trade_losses} realized_total={_realized_total:.2f})")
+            _realized_total = trade_total_net
+            _realized_total_gross = trade_total_gross
+            _realized_total_fees = trade_total_fees
+        print(f"[PERF_GUARD] Loaded {len(trade_pnls)} trades from live_trades.csv (wins={trade_wins} losses={trade_losses} realized_total={_realized_total:.2f})")
         return
 
     path = os.path.join("logs", "order_actions.jsonl")
     if not os.path.exists(path):
         if state_total is not None:
             _realized_total = state_total
+            _realized_total_gross = state_total
+            _realized_total_fees = 0.0
             print(f"[PERF_GUARD] Loaded realized_total from live_positions.json: {_realized_total:.2f}")
         return
     try:
@@ -748,6 +839,8 @@ def _load_perf_guard_history():
                 except Exception:
                     continue
                 realized = payload.get("realized_pnl")
+                realized_net = payload.get("realized_pnl_net")
+                fee_est = payload.get("fee_total_est")
                 if realized is None or realized == "":
                     continue
                 outcome = payload.get("outcome")
@@ -758,17 +851,32 @@ def _load_perf_guard_history():
                     realized = float(realized)
                 except Exception:
                     continue
-                entries.append((realized, outcome))
+                try:
+                    fee_est = float(fee_est) if fee_est is not None and fee_est != "" else 0.0
+                except Exception:
+                    fee_est = 0.0
+                if realized_net is None or realized_net == "":
+                    realized_net = realized - fee_est
+                else:
+                    try:
+                        realized_net = float(realized_net)
+                    except Exception:
+                        realized_net = realized - fee_est
+                entries.append((realized_net, realized, fee_est, outcome))
         if not entries:
             return
         entries = entries[-max_trades:]
         wins = 0
         losses = 0
         total = 0.0
+        total_gross = 0.0
+        total_fees = 0.0
         pnl_list = []
-        for realized, outcome in entries:
-            total += realized
-            pnl_list.append(realized)
+        for realized_net, realized_gross, fee_est, outcome in entries:
+            total += realized_net
+            total_gross += realized_gross
+            total_fees += fee_est
+            pnl_list.append(realized_net)
             if isinstance(outcome, str):
                 o = outcome.upper()
                 if o == "W":
@@ -777,17 +885,21 @@ def _load_perf_guard_history():
                 if o == "L":
                     losses += 1
                     continue
-            if realized > 0:
+            if realized_net > 0:
                 wins += 1
-            elif realized < 0:
+            elif realized_net < 0:
                 losses += 1
         _win_count = wins
         _loss_count = losses
         _realized_total = total
+        _realized_total_gross = total_gross
+        _realized_total_fees = total_fees
         if pnl_list:
             _autopilot_trade_pnls = pnl_list[-AUTOPILOT_MAX_RECENT_TRADES:]
         if state_total is not None:
             _realized_total = state_total
+            _realized_total_gross = state_total
+            _realized_total_fees = 0.0
             print(f"[PERF_GUARD] Loaded {len(entries)} trades from history (wins={wins} losses={losses} realized_total={total:.2f}); using live_positions total={state_total:.2f}")
         else:
             print(f"[PERF_GUARD] Loaded {len(entries)} trades from history (wins={wins} losses={losses} realized_total={total:.2f})")
@@ -935,11 +1047,13 @@ def _build_ta_context(symbol, indicators, recent_ohlcv, candle_patterns):
         "candle_patterns": candle_patterns or []
     }
 
-def _build_perf_summary(win_count, loss_count, realized_total, trade_count, win_rate, underperforming, equity):
+def _build_perf_summary(win_count, loss_count, realized_total, trade_count, win_rate, underperforming, equity, realized_total_gross=None, realized_total_fees=None):
     summary = {
         "wins": win_count,
         "losses": loss_count,
         "realized_total": realized_total,
+        "realized_total_gross": realized_total_gross if realized_total_gross is not None else realized_total,
+        "realized_total_fees": realized_total_fees if realized_total_fees is not None else 0.0,
         "win_rate": (win_rate if trade_count else 0.0),
         "underperforming": underperforming,
         "trade_count": trade_count,
@@ -1031,7 +1145,7 @@ def _log_portfolio_snapshot(snapshot, tag, symbol=None):
     except Exception:
         pass
 
-def _log_order_action(symbol, action, result, mode=None, outcome=None, realized_pnl=None, reward_score=None, llm_payload=None, last_price=None):
+def _log_order_action(symbol, action, result, mode=None, outcome=None, realized_pnl=None, realized_pnl_net=None, fee_total_est=None, slippage_est=None, reward_score=None, llm_payload=None, last_price=None):
     try:
         os.makedirs("logs", exist_ok=True)
         csv_path = os.path.join("logs", "order_actions.csv")
@@ -1074,7 +1188,7 @@ def _log_order_action(symbol, action, result, mode=None, outcome=None, realized_
             if not file_exists:
                 writer.writerow([
                     "timestamp", "symbol", "action", "order_type", "side", "qty", "price", "status", "mode",
-                    "outcome", "realized_pnl", "reward_score",
+                    "outcome", "realized_pnl", "realized_pnl_net", "fee_total_est", "slippage_est", "reward_score",
                     "stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
                     "stop_loss_price", "take_profit_price", "trailing_stop_price"
                 ])
@@ -1090,6 +1204,9 @@ def _log_order_action(symbol, action, result, mode=None, outcome=None, realized_
                 mode or "",
                 outcome or "",
                 realized_pnl if realized_pnl is not None else "",
+                realized_pnl_net if realized_pnl_net is not None else "",
+                fee_total_est if fee_total_est is not None else "",
+                slippage_est if slippage_est is not None else "",
                 reward_score if reward_score is not None else "",
                 stop_loss_pct if stop_loss_pct is not None else "",
                 take_profit_pct if take_profit_pct is not None else "",
@@ -1108,6 +1225,9 @@ def _log_order_action(symbol, action, result, mode=None, outcome=None, realized_
                 "mode": mode,
                 "outcome": outcome,
                 "realized_pnl": realized_pnl,
+                "realized_pnl_net": realized_pnl_net,
+                "fee_total_est": fee_total_est,
+                "slippage_est": slippage_est,
                 "reward_score": reward_score,
                 "stop_loss_pct": stop_loss_pct,
                 "take_profit_pct": take_profit_pct,
@@ -1506,7 +1626,7 @@ def _update_trade_tracker(symbol, last_price):
     except Exception:
         pass
 
-def _on_trade_open(symbol, entry_price, qty=None):
+def _on_trade_open(symbol, entry_price, qty=None, order_type=None):
     try:
         px = float(entry_price) if entry_price is not None else None
         if px is None:
@@ -1518,7 +1638,8 @@ def _on_trade_open(symbol, entry_price, qty=None):
                 "entry_price": px,
                 "qty": float(qty or 0.0),
                 "max_price": px,
-                "min_price": px
+                "min_price": px,
+                "entry_order_type": order_type
             }
         else:
             tracker["qty"] = float(tracker.get("qty", 0.0) or 0.0) + float(qty or 0.0)
@@ -2071,6 +2192,8 @@ _loading_spin_last = 0.0
 _win_count = 0
 _loss_count = 0
 _realized_total = 0.0
+_realized_total_gross = 0.0
+_realized_total_fees = 0.0
 _autopilot_trade_pnls = []
 _autopilot_last_tune_ts = 0.0
 _autopilot_tune_mtime = 0.0
@@ -2730,7 +2853,9 @@ while True:
                     trade_count,
                     win_rate,
                     underperforming,
-                    equity
+                    equity,
+                    realized_total_gross=_realized_total_gross,
+                    realized_total_fees=_realized_total_fees
                 )
                 risk_state = _build_risk_state(
                     equity,
@@ -2743,6 +2868,11 @@ while True:
                 )
                 execution_context = _build_execution_context(symbol, trades_by_symbol, portfolio_context)
                 execution_context["decision_candle_close_ts"] = last_candle_close_ts
+                execution_context["fee_model"] = {
+                    "maker_pct": KRAKEN_MAKER_FEE_PCT,
+                    "taker_pct": KRAKEN_TAKER_FEE_PCT,
+                    "slippage_pct": ESTIMATED_SLIPPAGE_PCT
+                }
                 if multi_tf:
                     execution_context["multi_timeframe"] = multi_tf
                 wallet_state = _build_wallet_state(account_info, trader, equity)
@@ -3142,17 +3272,24 @@ while True:
                                     last_price=last_price
                                 )
                                 continue
-                        
                         # EXECUTE
                         log_symbol = action.get("symbol", symbol)
                         res = execute_llm_action(execution_client, action)
                         print(f"🔥 [{EXECUTION_MODE.upper()}] {summary} | Status: {res.get('status', 'SUCCESS')}")
                         _record_attempt(log_symbol, action.get("side"), res.get("status", "SUCCESS"), res.get("info"), qty=action.get("quantity"), price=order_price)
+                        entry_price_for_fee = None
+                        entry_order_type_for_fee = None
                         if res.get("status") not in ("REJECTED", "ERROR"):
                             side = str(action.get("side", "")).upper()
                             if side == "BUY":
-                                _on_trade_open(_to_slash_symbol(log_symbol), order_price, qty=action.get("quantity"))
+                                _on_trade_open(
+                                    _to_slash_symbol(log_symbol),
+                                    order_price,
+                                    qty=action.get("quantity"),
+                                    order_type=action.get("type")
+                                )
                             elif side == "SELL":
+                                entry_price_for_fee, entry_order_type_for_fee = _get_entry_info(log_symbol)
                                 _on_trade_close(_to_slash_symbol(log_symbol), order_price, reason="sell")
                         outcome = None
                         realized_pnl = None
@@ -3183,9 +3320,31 @@ while True:
                                             outcome = "W" if est > 0 else ("L" if est < 0 else "B")
                                     except Exception:
                                         pass
+                        fee_total_est = None
+                        slippage_est = None
+                        realized_pnl_net = None
                         if realized_pnl is not None:
-                            _record_win_loss(realized_pnl, symbol=log_symbol)
-                        reward_score = realized_pnl if realized_pnl is not None else 0.0
+                            try:
+                                qty_for_fee = action.get("quantity") if isinstance(action, dict) else None
+                                exit_px_for_fee = order_price or last_price or (action.get("price") if isinstance(action, dict) else None)
+                                fee_total_est, slippage_est = _estimate_round_trip_costs(
+                                    log_symbol,
+                                    qty_for_fee,
+                                    exit_px_for_fee,
+                                    exit_order_type=(action.get("type") if isinstance(action, dict) else None),
+                                    entry_price=entry_price_for_fee,
+                                    entry_order_type=entry_order_type_for_fee
+                                )
+                                if fee_total_est is not None:
+                                    realized_pnl_net = float(realized_pnl) - float(fee_total_est)
+                            except Exception:
+                                fee_total_est = None
+                                slippage_est = None
+                        if realized_pnl_net is not None:
+                            outcome = "W" if realized_pnl_net > 0 else ("L" if realized_pnl_net < 0 else "B")
+                        if realized_pnl is not None:
+                            _record_win_loss(realized_pnl, symbol=log_symbol, realized_pnl_net=realized_pnl_net, fee_total=fee_total_est)
+                        reward_score = realized_pnl_net if realized_pnl_net is not None else (realized_pnl if realized_pnl is not None else 0.0)
                         _log_order_action(
                             log_symbol,
                             action,
@@ -3193,12 +3352,15 @@ while True:
                             mode=EXECUTION_MODE,
                             outcome=outcome,
                             realized_pnl=realized_pnl,
+                            realized_pnl_net=realized_pnl_net,
+                            fee_total_est=fee_total_est,
+                            slippage_est=slippage_est,
                             reward_score=reward_score,
                             llm_payload=current_llm,
                             last_price=last_price
                         )
                         _log_portfolio_snapshot(portfolio_context, tag="trade_execute", symbol=log_symbol)
-                        _autopilot_on_realized_pnl(realized_pnl, symbol=log_symbol)
+                        _autopilot_on_realized_pnl(realized_pnl_net if realized_pnl_net is not None else realized_pnl, symbol=log_symbol)
                         if res.get("status") in ("REJECTED", "ERROR"):
                             reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                         if res.get("status") not in ("REJECTED", "ERROR"):
@@ -3216,8 +3378,20 @@ while True:
                                 trader.enter(last_price, (action['quantity'] * last_price), symbol, size_in_dollars=False)
                             else:
                                 realized_pnl = trader.exit(symbol, price=last_price)
-                                _autopilot_on_realized_pnl(realized_pnl, symbol=log_symbol)
-                                _record_win_loss(realized_pnl, symbol=log_symbol)
+                                _autopilot_on_realized_pnl(realized_pnl_net if realized_pnl_net is not None else realized_pnl, symbol=log_symbol)
+                                fee_total_est, slippage_est = _estimate_round_trip_costs(
+                                    log_symbol,
+                                    action.get("quantity"),
+                                    last_price,
+                                    exit_order_type=(action.get("type") if isinstance(action, dict) else None)
+                                )
+                                realized_pnl_net = None
+                                if realized_pnl is not None and fee_total_est is not None:
+                                    try:
+                                        realized_pnl_net = float(realized_pnl) - float(fee_total_est)
+                                    except Exception:
+                                        realized_pnl_net = None
+                                _record_win_loss(realized_pnl, symbol=log_symbol, realized_pnl_net=realized_pnl_net, fee_total=fee_total_est)
                     except Exception as e:
                         print(f"❌ Execution Fail: {e}")
 
@@ -3237,10 +3411,26 @@ while True:
                     pos = trader.positions.get(s, {}) if hasattr(trader, "positions") else {}
                     qty = float(pos.get("size", 0.0) or 0.0)
                     realized_pnl = _estimate_realized_pnl(s, qty, prices.get(s), trader)
+                    realized_pnl_net = None
+                    fee_total_est = None
+                    slippage_est = None
                     outcome = None
                     if realized_pnl is not None:
-                        outcome = "W" if realized_pnl > 0 else ("L" if realized_pnl < 0 else "B")
-                        _record_win_loss(realized_pnl, symbol=s)
+                        fee_total_est, slippage_est = _estimate_round_trip_costs(
+                            s,
+                            qty,
+                            prices.get(s),
+                            exit_order_type="MARKET"
+                        )
+                        if fee_total_est is not None:
+                            try:
+                                realized_pnl_net = float(realized_pnl) - float(fee_total_est)
+                            except Exception:
+                                realized_pnl_net = None
+                        outcome = "W" if (realized_pnl_net if realized_pnl_net is not None else realized_pnl) > 0 else (
+                            "L" if (realized_pnl_net if realized_pnl_net is not None else realized_pnl) < 0 else "B"
+                        )
+                        _record_win_loss(realized_pnl, symbol=s, realized_pnl_net=realized_pnl_net, fee_total=fee_total_est)
                     _log_order_action(
                         s,
                         {"action": "AUTO_EXIT", "side": "SELL", "symbol": s.replace("/", ""), "type": "MARKET"},
@@ -3248,6 +3438,9 @@ while True:
                         mode=EXECUTION_MODE,
                         outcome=outcome or reason,
                         realized_pnl=realized_pnl,
+                        realized_pnl_net=realized_pnl_net,
+                        fee_total_est=fee_total_est,
+                        slippage_est=slippage_est,
                         reward_score=None,
                         llm_payload=llm_outputs.get(s, {}),
                         last_price=prices.get(s)
@@ -3261,10 +3454,26 @@ while True:
                         v_qty, _ = live_execution_client.validate_order(s, qty)
                         live_execution_client.create_order(symbol=s, side="SELL", type="MARKET", quantity=v_qty)
                         realized_pnl = _estimate_realized_pnl(s, v_qty, prices.get(s), trader)
+                        realized_pnl_net = None
+                        fee_total_est = None
+                        slippage_est = None
                         outcome = None
                         if realized_pnl is not None:
-                            outcome = "W" if realized_pnl > 0 else ("L" if realized_pnl < 0 else "B")
-                            _record_win_loss(realized_pnl, symbol=s)
+                            fee_total_est, slippage_est = _estimate_round_trip_costs(
+                                s,
+                                v_qty,
+                                prices.get(s),
+                                exit_order_type="MARKET"
+                            )
+                            if fee_total_est is not None:
+                                try:
+                                    realized_pnl_net = float(realized_pnl) - float(fee_total_est)
+                                except Exception:
+                                    realized_pnl_net = None
+                            outcome = "W" if (realized_pnl_net if realized_pnl_net is not None else realized_pnl) > 0 else (
+                                "L" if (realized_pnl_net if realized_pnl_net is not None else realized_pnl) < 0 else "B"
+                            )
+                            _record_win_loss(realized_pnl, symbol=s, realized_pnl_net=realized_pnl_net, fee_total=fee_total_est)
                         _log_order_action(
                             s,
                             {"action": "AUTO_EXIT", "side": "SELL", "symbol": s.replace("/", ""), "type": "MARKET"},
@@ -3272,6 +3481,9 @@ while True:
                             mode=EXECUTION_MODE,
                             outcome=outcome or reason,
                             realized_pnl=realized_pnl,
+                            realized_pnl_net=realized_pnl_net,
+                            fee_total_est=fee_total_est,
+                            slippage_est=slippage_est,
                             reward_score=None,
                             llm_payload=llm_outputs.get(s, {}),
                             last_price=prices.get(s)
@@ -3367,7 +3579,11 @@ while True:
                 losses = latest_llm_perf.get("losses")
                 wr = latest_llm_perf.get("win_rate")
                 rt = latest_llm_perf.get("realized_total")
-                prompt_lines.append(f"Perf: wins={wins} losses={losses} win_rate={wr:.2%} realized_total={rt}")
+                rt_gross = latest_llm_perf.get("realized_total_gross")
+                rt_fees = latest_llm_perf.get("realized_total_fees")
+                prompt_lines.append(
+                    f"Perf: wins={wins} losses={losses} win_rate={wr:.2%} net={rt} gross={rt_gross} fees={rt_fees}"
+                )
             except Exception:
                 prompt_lines.append(f"Perf: {latest_llm_perf}")
             try:

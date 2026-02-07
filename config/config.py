@@ -87,6 +87,13 @@ MAX_ORDER_COUNT_10S = 8
 ATTEMPT_LOG_COOLDOWN_SECONDS = 20
 ATTEMPT_LOG_DEDUP_BY_REASON = True
 
+# Fee + slippage estimates (used for net PnL and win/loss)
+# Kraken tier 1: Maker 0.25%, Taker 0.40%
+KRAKEN_MAKER_FEE_PCT = 0.0025
+KRAKEN_TAKER_FEE_PCT = 0.004
+ESTIMATED_SLIPPAGE_PCT = 0.0075
+
+
 # Symbols and strategy
 # - SYMBOLS: list of markets (exchange pairs)
 # - TIMEFRAME: OHLCV timeframe for indicators
