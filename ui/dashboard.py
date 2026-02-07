@@ -65,8 +65,6 @@ class RealTimeEquityPlot:
         self._realized_cache_mtime = 0.0
         self._realized_cache_total = None
         self._realized_cache_trades = 0
-        self._autopilot_tune_mtime = 0.0
-        self._autopilot_tune_last = ""
         self._snapshot_stats_mtime = 0.0
         self._snapshot_first_value = None
         self._snapshot_first_ts = None
@@ -231,11 +229,6 @@ class RealTimeEquityPlot:
             self.header_frame, text="Wins/Losses: 0/0 (0.0%)", font=("Helvetica", 12), bg=self.panel, fg=self.text
         )
         self.win_loss_label.pack(side=tk.LEFT, padx=10)
-
-        self.autopilot_label = tk.Label(
-            self.header_frame, text="", font=("Helvetica", 12), bg=self.panel, fg="#22c55e"
-        )
-        self.autopilot_label.pack(side=tk.LEFT, padx=10)
 
         self.mock_wallet_label = None
         if self.show_mock_wallet:
@@ -542,6 +535,7 @@ class RealTimeEquityPlot:
         self.prompt_text = tk.Text(self.prompt_frame, height=18, width=90, yscrollcommand=self.prompt_scroll.set, bg=self.panel, fg=self.text, insertbackground=self.text)
         self.prompt_text.pack(fill=tk.BOTH, expand=True)
         self.prompt_scroll.config(command=self.prompt_text.yview)
+        self.prompt_text.tag_configure("TUNE", foreground="#f59e0b")
         self.prompt_history = []
 
         # -----------------------------
@@ -866,35 +860,6 @@ class RealTimeEquityPlot:
         except Exception:
             return (0, 0)
 
-    def _load_autopilot_last_tune(self):
-        try:
-            path = os.path.join("logs", "autopilot_tuning.jsonl")
-            if not os.path.exists(path):
-                return ""
-            mtime = os.path.getmtime(path)
-            if mtime == self._autopilot_tune_mtime:
-                return self._autopilot_tune_last
-            last_line = ""
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        last_line = line.strip()
-            if not last_line:
-                return ""
-            payload = json.loads(last_line)
-            ts = float(payload.get("timestamp", 0.0) or 0.0)
-            reason = payload.get("reason") or "update"
-            updates = payload.get("updates") or {}
-            updates_str = ", ".join([f"{k}={v}" for k, v in updates.items()]) if isinstance(updates, dict) else ""
-            updates_str = updates_str[:120] + ("…" if len(updates_str) > 120 else "")
-            tstr = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "unknown"
-            message = f"Autopilot tuned {tstr} ({reason}) {updates_str}"
-            self._autopilot_tune_mtime = mtime
-            self._autopilot_tune_last = message
-            return message
-        except Exception:
-            return self._autopilot_tune_last
-
     def _filter_equity_spike(self, equity, live_prices):
         if equity is None or not math.isfinite(equity):
             return None
@@ -1006,25 +971,71 @@ class RealTimeEquityPlot:
                 self._snapshot_peak_ts,
             )
 
+    def _load_locked_baseline(self):
+        path = os.path.join("data", "historical_baseline.json")
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            val = data.get("baseline")
+            try:
+                val = float(val)
+            except Exception:
+                return None
+            if not math.isfinite(val) or val <= 0:
+                return None
+            return val
+        except Exception:
+            return None
+
     def _get_historical_baseline(self):
-        hist_peak = None
+        locked = self._load_locked_baseline()
+        if locked is not None and locked > 0:
+            return float(locked)
+        hist_val = None
+        hist_ts = None
         if self.equity_history:
             try:
-                hist_peak = max(float(x) for x in self.equity_history if math.isfinite(float(x)))
+                hist_val = float(self.equity_history[0])
             except Exception:
-                hist_peak = None
+                hist_val = None
+        if self.equity_timestamps and len(self.equity_timestamps) == len(self.equity_history):
+            min_ts = None
+            min_idx = None
+            for idx, raw_ts in enumerate(self.equity_timestamps):
+                try:
+                    ts = float(raw_ts)
+                except Exception:
+                    continue
+                if not math.isfinite(ts) or ts <= 0:
+                    continue
+                if min_ts is None or ts < min_ts:
+                    min_ts = ts
+                    min_idx = idx
+            if min_idx is not None:
+                try:
+                    hist_val = float(self.equity_history[min_idx])
+                except Exception:
+                    hist_val = hist_val
+                hist_ts = min_ts
 
         _snap_first_val, _snap_first_ts, snap_peak_val, _snap_peak_ts = self._load_portfolio_snapshot_stats()
         candidates = []
-        if hist_peak is not None and hist_peak > 0:
-            candidates.append(hist_peak)
-        if snap_peak_val is not None and snap_peak_val > 0:
-            candidates.append(snap_peak_val)
+        if hist_val is not None and hist_val > 0:
+            candidates.append(("hist", hist_ts, hist_val))
+        if _snap_first_val is not None and _snap_first_val > 0:
+            candidates.append(("snap", _snap_first_ts, _snap_first_val))
+        ts_candidates = [c for c in candidates if c[1] is not None and c[1] > 0]
+        if ts_candidates:
+            return float(min(ts_candidates, key=lambda c: c[1])[2])
+        if candidates:
+            return float(candidates[0][2])
         if self.start_equity is not None and self.start_equity > 0:
-            candidates.append(float(self.start_equity))
+            return float(self.start_equity)
         if self.baseline is not None and self.baseline > 0:
-            candidates.append(float(self.baseline))
-        return float(max(candidates) if candidates else 0.0)
+            return float(self.baseline)
+        return 0.0
 
     def _get_filtered_series(self):
         if not self.equity_history:
@@ -1195,16 +1206,16 @@ class RealTimeEquityPlot:
                 history = data.get("equity") or []
                 timestamps = data.get("timestamps") or []
                 if isinstance(history, list):
-                    self.equity_history = [float(x) for x in history][-5000:]
+                    self.equity_history = [float(x) for x in history]
                 if isinstance(timestamps, list):
-                    self.equity_timestamps = [float(x) for x in timestamps][-5000:]
+                    self.equity_timestamps = [float(x) for x in timestamps]
                 if self.equity_history and (not self.equity_timestamps or len(self.equity_timestamps) != len(self.equity_history)):
                     now = time.time()
                     step = 1.0
                     start = now - step * (len(self.equity_history) - 1)
                     self.equity_timestamps = [start + step * i for i in range(len(self.equity_history))]
             elif isinstance(data, list):
-                self.equity_history = [float(x) for x in data][-5000:]
+                self.equity_history = [float(x) for x in data]
                 now = time.time()
                 step = 1.0
                 start = now - step * (len(self.equity_history) - 1)
@@ -1230,8 +1241,8 @@ class RealTimeEquityPlot:
                     window.append(val)
                     if len(window) > 20:
                         window.pop(0)
-                self.equity_history = cleaned_vals[-5000:]
-                self.equity_timestamps = cleaned_ts[-5000:]
+                self.equity_history = cleaned_vals
+                self.equity_timestamps = cleaned_ts
         except Exception:
             pass
 
@@ -1240,8 +1251,8 @@ class RealTimeEquityPlot:
             os.makedirs(os.path.dirname(self.equity_history_path), exist_ok=True)
             with open(self.equity_history_path, "w") as f:
                 payload = {
-                    "equity": self.equity_history[-5000:],
-                    "timestamps": self.equity_timestamps[-5000:]
+                    "equity": self.equity_history,
+                    "timestamps": self.equity_timestamps
                 }
                 json.dump(payload, f)
         except Exception:
@@ -1472,7 +1483,7 @@ class RealTimeEquityPlot:
         hist_pnl = float(current_total) - baseline_value if baseline_value > 0 else 0.0
         hist_pct = (hist_pnl / baseline_value * 100.0) if baseline_value > 0 else 0.0
         self.realized_pnl_label.config(text=f"Historical PnL: ${hist_pnl:.2f} ({hist_pct:.2f}%)")
-        self.baseline = max(0, getattr(self.trader, "starting_capital", 0))
+        self.baseline = baseline_value if baseline_value and baseline_value > 0 else max(0, getattr(self.trader, "starting_capital", 0))
         self.baseline_line.set_ydata([self.baseline, self.baseline])
 
         # Win/Loss counters (persisted via logs)
@@ -1483,8 +1494,6 @@ class RealTimeEquityPlot:
             win_rate = (wins / total * 100.0) if total else 0.0
             self.win_loss_label.config(text=f"Wins/Losses: {wins}/{losses} ({win_rate:.1f}%)")
             self._win_loss_last_check = now
-            tune_msg = self._load_autopilot_last_tune()
-            self.autopilot_label.config(text=tune_msg)
 
         if self.account_info:
             cash = self.account_info.get("cash_usd")
@@ -1696,9 +1705,17 @@ class RealTimeEquityPlot:
 
         if self.prompt_text is not None and prompt_text is not None and (now - self._prompt_refresh_last) >= self._prompt_refresh_interval:
             if isinstance(prompt_text, (list, tuple)):
-                display_text = "\n".join([str(item) for item in prompt_text])
                 self.prompt_text.delete("1.0", tk.END)
-                self.prompt_text.insert(tk.END, display_text)
+                total = len(prompt_text)
+                for idx, item in enumerate(prompt_text):
+                    line = str(item)
+                    if idx < (total - 1):
+                        line += "\n"
+                    tag = "TUNE" if "Autopilot tuned" in line else None
+                    if tag:
+                        self.prompt_text.insert(tk.END, line, tag)
+                    else:
+                        self.prompt_text.insert(tk.END, line)
                 self.prompt_text.see(tk.END)
                 self._prompt_refresh_last = now
             else:
@@ -1710,7 +1727,14 @@ class RealTimeEquityPlot:
                     self.prompt_history = self.prompt_history[-50:]
                 self.prompt_text.delete("1.0", tk.END)
                 for entry in self.prompt_history:
-                    self.prompt_text.insert(tk.END, entry + "\n" + ("-" * 40) + "\n")
+                    lines = str(entry).splitlines() or [""]
+                    for line in lines:
+                        tag = "TUNE" if "Autopilot tuned" in line else None
+                        if tag:
+                            self.prompt_text.insert(tk.END, line + "\n", tag)
+                        else:
+                            self.prompt_text.insert(tk.END, line + "\n")
+                    self.prompt_text.insert(tk.END, ("-" * 40) + "\n")
                 self.prompt_text.see(tk.END)
                 self._prompt_refresh_last = now
         if (now - self._text_refresh_last) >= self._text_refresh_interval:

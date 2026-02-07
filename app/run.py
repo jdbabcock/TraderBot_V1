@@ -209,9 +209,28 @@ run_startup_ui(CONFIG_PATH)
 # -----------------------------
 # 2. Bot Configuration
 # -----------------------------
+def _is_real_key(value):
+    if not value:
+        return False
+    v = str(value).strip()
+    if not v:
+        return False
+    placeholder_tokens = (
+        "YOUR_",
+        "_HERE",
+        "CHANGEME",
+        "REPLACE_ME",
+        "PLACEHOLDER",
+        "NOT_SET",
+        "NOT SET",
+    )
+    v_upper = v.upper()
+    return not any(token in v_upper for token in placeholder_tokens)
+
+
 load_dotenv(ENV_PATH)
 openai.api_key = os.getenv("OPENAI_API_KEY")
-print(f"🔐 OpenAI key set: {bool(os.getenv('OPENAI_API_KEY'))}")
+print(f"🔐 OpenAI key set: {_is_real_key(os.getenv('OPENAI_API_KEY'))}")
 try:
     import core.data.llm_signal_engine as llm_signal_engine
     llm_signal_engine.OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -311,8 +330,8 @@ _backfill_order_actions_logs()
 
 # Sanity check for Kraken keys (presence only, never values)
 if EXCHANGE == "kraken":
-    kraken_key_ok = bool(os.getenv("KRAKEN_API_KEY"))
-    kraken_secret_ok = bool(os.getenv("KRAKEN_API_SECRET"))
+    kraken_key_ok = _is_real_key(os.getenv("KRAKEN_API_KEY"))
+    kraken_secret_ok = _is_real_key(os.getenv("KRAKEN_API_SECRET"))
     print(f"🔑 Kraken keys set: key={kraken_key_ok} secret={kraken_secret_ok}")
 
 style_settings = STYLE_PRESETS.get(TRADING_STYLE, {})
@@ -1183,6 +1202,36 @@ def _log_autopilot_tuning(updates, reason=None):
     except Exception:
         pass
 
+def _load_autopilot_tune_message():
+    global _autopilot_tune_mtime, _autopilot_tune_last
+    try:
+        path = os.path.join("logs", "autopilot_tuning.jsonl")
+        if not os.path.exists(path):
+            return ""
+        mtime = os.path.getmtime(path)
+        if mtime == _autopilot_tune_mtime:
+            return _autopilot_tune_last
+        last_line = ""
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    last_line = line.strip()
+        if not last_line:
+            return ""
+        payload = json.loads(last_line)
+        ts = float(payload.get("timestamp", 0.0) or 0.0)
+        reason = payload.get("reason") or "update"
+        updates = payload.get("updates") or {}
+        updates_str = ", ".join([f"{k}={v}" for k, v in updates.items()]) if isinstance(updates, dict) else ""
+        updates_str = updates_str[:120] + ("…" if len(updates_str) > 120 else "")
+        tstr = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "unknown"
+        message = f"Autopilot tuned {tstr} ({reason}) {updates_str}"
+        _autopilot_tune_mtime = mtime
+        _autopilot_tune_last = message
+        return message
+    except Exception:
+        return _autopilot_tune_last
+
 def _apply_autopilot_overrides(overrides, reason=None):
     global MIN_CONFIDENCE_TO_ORDER
     global SIZE_FRACTION_DEFAULT
@@ -2024,25 +2073,30 @@ _loss_count = 0
 _realized_total = 0.0
 _autopilot_trade_pnls = []
 _autopilot_last_tune_ts = 0.0
+_autopilot_tune_mtime = 0.0
+_autopilot_tune_last = ""
 _perf_guard_state = "normal"
 _perf_guard_last_log = 0.0
 _autopilot_last_persist_ts = 0.0
 _snapshot_stats_mtime = 0.0
-_snapshot_peak_value = None
-_equity_history_peak_mtime = 0.0
-_equity_history_peak_value = None
+_snapshot_first_value = None
+_snapshot_first_ts = None
+_equity_history_stats_mtime = 0.0
+_equity_history_first_value = None
+_equity_history_first_ts = None
 _load_perf_guard_history()
 
-def _load_portfolio_snapshot_peak():
-    global _snapshot_stats_mtime, _snapshot_peak_value
+def _load_portfolio_snapshot_first():
+    global _snapshot_stats_mtime, _snapshot_first_value, _snapshot_first_ts
     path = os.path.join("logs", "portfolio_snapshots.jsonl")
     if not os.path.exists(path):
-        return None
+        return (None, None)
     try:
         mtime = os.path.getmtime(path)
         if mtime == _snapshot_stats_mtime:
-            return _snapshot_peak_value
-        peak_val = None
+            return (_snapshot_first_value, _snapshot_first_ts)
+        first_val = None
+        first_ts = None
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -2052,6 +2106,11 @@ def _load_portfolio_snapshot_peak():
                     row = json.loads(line)
                 except Exception:
                     continue
+                ts = row.get("timestamp")
+                try:
+                    ts = float(ts) if ts is not None else None
+                except Exception:
+                    ts = None
                 snap = row.get("snapshot") or {}
                 val = None
                 for key in ("equity_usd", "total_usd", "cash_usd"):
@@ -2063,56 +2122,131 @@ def _load_portfolio_snapshot_peak():
                         break
                 if val is None or not math.isfinite(val) or val <= 0:
                     continue
-                if peak_val is None or val > peak_val:
-                    peak_val = val
+                if ts is not None and ts > 0:
+                    if first_ts is None or first_ts <= 0 or ts < first_ts:
+                        first_ts = ts
+                        first_val = val
+                elif first_val is None:
+                    first_val = val
         _snapshot_stats_mtime = mtime
-        _snapshot_peak_value = peak_val
-        return peak_val
+        _snapshot_first_value = first_val
+        _snapshot_first_ts = first_ts
+        return (first_val, first_ts)
     except Exception:
-        return _snapshot_peak_value
+        return (_snapshot_first_value, _snapshot_first_ts)
 
-def _load_equity_history_peak():
-    global _equity_history_peak_mtime, _equity_history_peak_value
+def _load_equity_history_first():
+    global _equity_history_stats_mtime, _equity_history_first_value, _equity_history_first_ts
     path = os.path.join("data", "equity_history.json")
     if not os.path.exists(path):
-        return None
+        return (None, None)
     try:
         mtime = os.path.getmtime(path)
-        if mtime == _equity_history_peak_mtime:
-            return _equity_history_peak_value
+        if mtime == _equity_history_stats_mtime:
+            return (_equity_history_first_value, _equity_history_first_ts)
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         values = []
+        timestamps = []
         if isinstance(data, dict):
             values = data.get("equity") or []
+            timestamps = data.get("timestamps") or []
         elif isinstance(data, list):
             values = data
-        peak_val = None
-        for v in values:
+        first_val = None
+        first_ts = None
+        if values:
             try:
-                val = float(v)
+                first_val = float(values[0])
             except Exception:
-                continue
-            if not math.isfinite(val) or val <= 0:
-                continue
-            if peak_val is None or val > peak_val:
-                peak_val = val
-        _equity_history_peak_mtime = mtime
-        _equity_history_peak_value = peak_val
-        return peak_val
+                first_val = None
+        if timestamps and len(timestamps) == len(values):
+            min_ts = None
+            min_idx = None
+            for idx, raw_ts in enumerate(timestamps):
+                try:
+                    ts = float(raw_ts)
+                except Exception:
+                    continue
+                if not math.isfinite(ts) or ts <= 0:
+                    continue
+                if min_ts is None or ts < min_ts:
+                    min_ts = ts
+                    min_idx = idx
+            if min_idx is not None:
+                try:
+                    first_val = float(values[min_idx])
+                except Exception:
+                    first_val = first_val
+                first_ts = min_ts
+        _equity_history_stats_mtime = mtime
+        _equity_history_first_value = first_val
+        _equity_history_first_ts = first_ts
+        return (first_val, first_ts)
     except Exception:
-        return _equity_history_peak_value
+        return (_equity_history_first_value, _equity_history_first_ts)
+
+def _load_locked_baseline():
+    path = os.path.join("data", "historical_baseline.json")
+    if not os.path.exists(path):
+        return (None, None)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        val = data.get("baseline")
+        ts = data.get("timestamp")
+        try:
+            val = float(val)
+        except Exception:
+            val = None
+        try:
+            ts = float(ts) if ts is not None else None
+        except Exception:
+            ts = None
+        if val is None or not math.isfinite(val) or val <= 0:
+            return (None, None)
+        return (val, ts)
+    except Exception:
+        return (None, None)
+
+def _maybe_lock_baseline(value, ts=None, source=None):
+    try:
+        if value is None:
+            return None
+        val = float(value)
+        if not math.isfinite(val) or val <= 0:
+            return None
+        path = os.path.join("data", "historical_baseline.json")
+        if os.path.exists(path):
+            return None
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "baseline": val,
+            "timestamp": float(ts) if ts is not None else time.time(),
+            "source": source or "account_sync"
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return val
+    except Exception:
+        return None
 
 def _get_historical_baseline():
+    locked_val, locked_ts = _load_locked_baseline()
+    if locked_val is not None and locked_val > 0:
+        return float(locked_val)
     candidates = []
-    snap_peak = _load_portfolio_snapshot_peak()
-    if snap_peak is not None and snap_peak > 0:
-        candidates.append(snap_peak)
-    hist_peak = _load_equity_history_peak()
-    if hist_peak is not None and hist_peak > 0:
-        candidates.append(hist_peak)
+    snap_val, snap_ts = _load_portfolio_snapshot_first()
+    if snap_val is not None and snap_val > 0:
+        candidates.append(("snap", snap_ts, snap_val))
+    hist_val, hist_ts = _load_equity_history_first()
+    if hist_val is not None and hist_val > 0:
+        candidates.append(("hist", hist_ts, hist_val))
+    ts_candidates = [c for c in candidates if c[1] is not None and c[1] > 0]
+    if ts_candidates:
+        return float(min(ts_candidates, key=lambda c: c[1])[2])
     if candidates:
-        return float(max(candidates))
+        return float(candidates[0][2])
     return None
 
 def _initial_account_sync():
@@ -2123,6 +2257,10 @@ def _initial_account_sync():
             return
         raw = account_client.get_balance()
         summary = _summarize_account(raw, live_prices)
+        try:
+            _maybe_lock_baseline(summary.get("total_usd"), ts=time.time(), source="kraken_account_sync")
+        except Exception:
+            pass
         live_cash = float(summary.get("cash_usd", 0.0))
         if hasattr(trader, "set_cash"):
             trader.set_cash(live_cash)
@@ -3232,6 +3370,12 @@ while True:
                 prompt_lines.append(f"Perf: wins={wins} losses={losses} win_rate={wr:.2%} realized_total={rt}")
             except Exception:
                 prompt_lines.append(f"Perf: {latest_llm_perf}")
+            try:
+                tune_msg = _load_autopilot_tune_message()
+                if tune_msg:
+                    prompt_lines.append(tune_msg)
+            except Exception:
+                pass
             try:
                 opp = latest_llm_perf.get("daily_opportunity_summary") or {}
                 if opp:

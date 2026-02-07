@@ -26,9 +26,28 @@ def _format_value(value):
         return value
     return json.dumps(value)
 
-def _mask_key(value):
+def _is_real_key(value):
     if not value:
-        return "Not set"
+        return False
+    v = str(value).strip()
+    if not v:
+        return False
+    placeholder_tokens = (
+        "YOUR_",
+        "_HERE",
+        "CHANGEME",
+        "REPLACE_ME",
+        "PLACEHOLDER",
+        "NOT_SET",
+        "NOT SET",
+    )
+    v_upper = v.upper()
+    return not any(token in v_upper for token in placeholder_tokens)
+
+
+def _mask_key(value):
+    if not _is_real_key(value):
+        return "Add keys"
     return "*" * 8
 
 
@@ -284,10 +303,10 @@ def run_startup_ui(config_path="config.py"):
             required += ["KRAKEN_API_KEY", "KRAKEN_API_SECRET"]
         else:
             required += ["BINANCE_API_KEY", "BINANCE_API_SECRET"]
-        missing = [k for k in required if not env_vars.get(k)]
+        missing = [k for k in required if not _is_real_key(env_vars.get(k))]
         if missing:
-            return "Keys: Not set"
-        return "Keys: Set"
+            return "Keys: NOT SET"
+        return "Keys: SET"
 
     keys_status = tk.Label(card, text=_keys_status_label(), bg="#000000", fg="#c9d1d9", font=("Helvetica", 10, "bold"))
     keys_status.pack(anchor="w", pady=(0, 12))
@@ -367,11 +386,26 @@ def run_startup_ui(config_path="config.py"):
                 entry.pack(anchor="w", padx=20)
                 return entry
 
-            e_openai = add_key_field("OpenAI API Key", env_vars.get("OPENAI_API_KEY", ""))
-            e_kraken_key = add_key_field("Kraken API Key", env_vars.get("KRAKEN_API_KEY", ""))
-            e_kraken_secret = add_key_field("Kraken API Secret", env_vars.get("KRAKEN_API_SECRET", ""))
-            e_binance_key = add_key_field("Binance API Key", env_vars.get("BINANCE_API_KEY", ""))
-            e_binance_secret = add_key_field("Binance API Secret", env_vars.get("BINANCE_API_SECRET", ""))
+            e_openai = add_key_field(
+                "OpenAI API Key",
+                env_vars.get("OPENAI_API_KEY", "") if _is_real_key(env_vars.get("OPENAI_API_KEY")) else ""
+            )
+            e_kraken_key = add_key_field(
+                "Kraken API Key",
+                env_vars.get("KRAKEN_API_KEY", "") if _is_real_key(env_vars.get("KRAKEN_API_KEY")) else ""
+            )
+            e_kraken_secret = add_key_field(
+                "Kraken API Secret",
+                env_vars.get("KRAKEN_API_SECRET", "") if _is_real_key(env_vars.get("KRAKEN_API_SECRET")) else ""
+            )
+            e_binance_key = add_key_field(
+                "Binance API Key",
+                env_vars.get("BINANCE_API_KEY", "") if _is_real_key(env_vars.get("BINANCE_API_KEY")) else ""
+            )
+            e_binance_secret = add_key_field(
+                "Binance API Secret",
+                env_vars.get("BINANCE_API_SECRET", "") if _is_real_key(env_vars.get("BINANCE_API_SECRET")) else ""
+            )
 
             btn_row = tk.Frame(editor, bg="#000000")
             btn_row.pack(anchor="w", padx=20, pady=16)
