@@ -1549,7 +1549,9 @@ latest_llm_ts = None
 TRADE_OUTCOMES_PATH = os.path.join("logs", "trade_outcomes.jsonl")
 PRICE_HISTORY_PATH = os.path.join("logs", "price_history.jsonl")
 LLM_PREDICTIONS_PATH = os.path.join("logs", "llm_predictions.jsonl")
+TRADE_PLANS_PATH = os.path.join("logs", "llm_trade_plans.jsonl")
 _trade_trackers = {}
+_trade_plans = {}
 _last_price_history_ts = 0.0
 _daily_opportunity_summary = {}
 _last_opportunity_day = None
@@ -1595,6 +1597,154 @@ def _append_llm_prediction(record):
             f.write(json.dumps(record) + "\n")
     except Exception:
         pass
+
+def _append_trade_plan(record):
+    try:
+        os.makedirs(os.path.dirname(TRADE_PLANS_PATH), exist_ok=True)
+        with open(TRADE_PLANS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+def _normalize_plan_type(value):
+    t = str(value or "").strip().upper()
+    return t if t in ("LIMIT", "MARKET") else None
+
+def _build_trade_plan(symbol, llm_result, last_price, candle_close_ts, now_ts):
+    if not isinstance(llm_result, dict):
+        return None
+    plan = llm_result.get("trade_plan")
+    if plan is None:
+        plan = llm_result.get("plan")
+    if not isinstance(plan, dict):
+        plan = {}
+    order_action = llm_result.get("order_action")
+    if not isinstance(order_action, dict):
+        order_action = None
+    side = None
+    if order_action:
+        side = order_action.get("side") or order_action.get("action")
+    if side:
+        side = str(side).upper()
+        if side in ("CLOSE", "EXIT", "CLOSE_POSITION"):
+            side = "SELL"
+    entry_type = _normalize_plan_type(plan.get("entry_type"))
+    exit_type = _normalize_plan_type(plan.get("exit_type"))
+    entry_price = plan.get("entry_price")
+    exit_price = plan.get("exit_price")
+    invalidation_price = plan.get("invalidation_price")
+    horizon_min = plan.get("horizon_min") or llm_result.get("prediction_horizon_min")
+    notes = plan.get("notes") or llm_result.get("reason")
+    if side == "BUY":
+        if not entry_type and order_action:
+            entry_type = _normalize_plan_type(order_action.get("type"))
+        if entry_price is None and order_action:
+            entry_price = order_action.get("price")
+    if side == "SELL":
+        if not exit_type and order_action:
+            exit_type = _normalize_plan_type(order_action.get("type"))
+        if exit_price is None and order_action:
+            exit_price = order_action.get("price")
+    try:
+        entry_price = float(entry_price) if entry_price is not None else None
+    except Exception:
+        entry_price = None
+    try:
+        exit_price = float(exit_price) if exit_price is not None else None
+    except Exception:
+        exit_price = None
+    try:
+        invalidation_price = float(invalidation_price) if invalidation_price is not None else None
+    except Exception:
+        invalidation_price = None
+    try:
+        horizon_min = int(round(float(horizon_min))) if horizon_min is not None else None
+    except Exception:
+        horizon_min = None
+    if side == "BUY" and entry_type == "LIMIT" and entry_price is None and last_price:
+        entry_price = float(last_price)
+    if side == "SELL" and exit_type == "LIMIT" and exit_price is None and last_price:
+        exit_price = float(last_price)
+    if not side:
+        return None
+    plan_id = f"{symbol}|{side}|{entry_type}|{entry_price}|{exit_type}|{exit_price}|{invalidation_price}|{horizon_min}"
+    plan_record = {
+        "symbol": symbol,
+        "side": side,
+        "plan_id": plan_id,
+        "ts": now_ts,
+        "candle_close_ts": candle_close_ts,
+        "entry_type": entry_type,
+        "entry_price": entry_price,
+        "exit_type": exit_type,
+        "exit_price": exit_price,
+        "invalidation_price": invalidation_price,
+        "horizon_min": horizon_min,
+        "stop_loss_pct": llm_result.get("stop_loss_pct"),
+        "take_profit_pct": llm_result.get("take_profit_pct"),
+        "trailing_stop_pct": llm_result.get("trailing_stop_pct"),
+        "notes": str(notes or "")[:200],
+        "status": "new"
+    }
+    existing = _trade_plans.get(symbol)
+    if existing and existing.get("plan_id") == plan_id:
+        return existing
+    _trade_plans[symbol] = plan_record
+    _append_trade_plan({"event": "plan_update", **plan_record})
+    return plan_record
+
+def _plan_is_invalid(plan, last_price, now_ts):
+    if not plan:
+        return True
+    horizon_min = plan.get("horizon_min")
+    if horizon_min:
+        try:
+            if (now_ts - float(plan.get("ts") or now_ts)) > (float(horizon_min) * 60.0):
+                return True
+        except Exception:
+            pass
+    inv = plan.get("invalidation_price")
+    if inv is not None and last_price is not None:
+        try:
+            inv = float(inv)
+            lp = float(last_price)
+            side = str(plan.get("side") or "").upper()
+            if side == "BUY" and lp <= inv:
+                return True
+            if side == "SELL" and lp >= inv:
+                return True
+        except Exception:
+            pass
+    return False
+
+def _apply_trade_plan(plan, action, last_price):
+    if not plan or not isinstance(action, dict):
+        return action, None
+    side = str(action.get("side") or action.get("action") or "").upper()
+    plan_side = str(plan.get("side") or "").upper()
+    if plan_side and side and plan_side != side:
+        return None, "PLAN_MISMATCH"
+    if side == "BUY":
+        ptype = plan.get("entry_type")
+        pprice = plan.get("entry_price")
+        if ptype:
+            action["type"] = ptype
+        if action.get("type") == "LIMIT":
+            if pprice is not None:
+                action["price"] = pprice
+            elif last_price is not None:
+                action["price"] = float(last_price)
+    elif side == "SELL":
+        ptype = plan.get("exit_type")
+        pprice = plan.get("exit_price")
+        if ptype:
+            action["type"] = ptype
+        if action.get("type") == "LIMIT":
+            if pprice is not None:
+                action["price"] = pprice
+            elif last_price is not None:
+                action["price"] = float(last_price)
+    return action, None
 
 def _log_price_history(prices, now_ts):
     global _last_price_history_ts
@@ -1798,6 +1948,74 @@ def _compute_prediction_stats(symbol_prices, predictions, end_ts):
         }
     return pred_count, pred_hits, pred_conv, horizon_stats
 
+def _load_fee_summary(start_ts, end_ts):
+    summary = {
+        "trades": 0,
+        "gross": 0.0,
+        "net": 0.0,
+        "fees": 0.0,
+        "slippage": 0.0
+    }
+    path = os.path.join("logs", "order_actions.jsonl")
+    if not os.path.exists(path):
+        return summary
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                ts = row.get("ts") or row.get("timestamp")
+                if ts is None:
+                    continue
+                try:
+                    ts = float(ts)
+                except Exception:
+                    continue
+                if start_ts is not None and ts < start_ts:
+                    continue
+                if end_ts is not None and ts > end_ts:
+                    continue
+                gross = row.get("realized_pnl")
+                net = row.get("realized_pnl_net")
+                fee = row.get("fee_total_est")
+                slip = row.get("slippage_est")
+                if gross is None and net is None and fee is None and slip is None:
+                    continue
+                summary["trades"] += 1
+                if gross is not None:
+                    try:
+                        summary["gross"] += float(gross)
+                    except Exception:
+                        pass
+                if net is not None:
+                    try:
+                        summary["net"] += float(net)
+                    except Exception:
+                        pass
+                elif gross is not None and fee is not None:
+                    try:
+                        summary["net"] += float(gross) - float(fee)
+                    except Exception:
+                        pass
+                if fee is not None:
+                    try:
+                        summary["fees"] += float(fee)
+                    except Exception:
+                        pass
+                if slip is not None:
+                    try:
+                        summary["slippage"] += float(slip)
+                    except Exception:
+                        pass
+    except Exception:
+        return summary
+    return summary
+
 def _maybe_daily_opportunity_reflection(now_ts):
     global _daily_opportunity_summary, _last_opportunity_day
     local = time.localtime(now_ts)
@@ -1874,6 +2092,12 @@ def _maybe_daily_opportunity_reflection(now_ts):
     except Exception:
         predictions = []
     summary = _compute_daily_opportunity_summary(prev_day_key, symbol_prices, trades, predictions)
+    try:
+        start_ts = time.mktime(time.strptime(prev_day_key + " 00:00:00", "%Y-%m-%d %H:%M:%S"))
+        end_ts = time.mktime(time.strptime(prev_day_key + " 23:59:59", "%Y-%m-%d %H:%M:%S"))
+        summary["fee_summary"] = _load_fee_summary(start_ts, end_ts)
+    except Exception:
+        summary["fee_summary"] = {}
     _daily_opportunity_summary = summary
     _last_opportunity_day = day_key
     try:
@@ -1971,6 +2195,10 @@ def _maybe_weekly_opportunity_reflection(now_ts):
         predictions
     )
     summary["week"] = week_label
+    try:
+        summary["fee_summary"] = _load_fee_summary(prev_start, prev_end)
+    except Exception:
+        summary["fee_summary"] = {}
     _weekly_opportunity_summary = summary
     _last_opportunity_week = week_key
     try:
@@ -2072,6 +2300,10 @@ def _maybe_monthly_opportunity_reflection(now_ts):
         predictions
     )
     summary["month"] = month_label
+    try:
+        summary["fee_summary"] = _load_fee_summary(prev_start, prev_end)
+    except Exception:
+        summary["fee_summary"] = {}
     _monthly_opportunity_summary = summary
     _last_opportunity_month = month_key
     try:
@@ -2169,6 +2401,10 @@ def _maybe_yearly_opportunity_reflection(now_ts):
         predictions
     )
     summary["year"] = year_label
+    try:
+        summary["fee_summary"] = _load_fee_summary(prev_start, prev_end)
+    except Exception:
+        summary["fee_summary"] = {}
     _yearly_opportunity_summary = summary
     _last_opportunity_year = year_key
     try:
@@ -2187,6 +2423,116 @@ def _append_llm_action_log(message):
             del _llm_action_log[0:len(_llm_action_log) - _llm_action_log_max]
     except Exception:
         pass
+
+def _build_strategy_text():
+    lines = []
+    sym = latest_llm_symbol
+    if not sym:
+        return ["Waiting for LLM decision..."]
+    lines.append(f"Symbol: {sym}")
+    llm = latest_llm_summary or {}
+    action = llm.get("order_action") or {}
+    if isinstance(action, dict) and action:
+        side = action.get("side") or action.get("action")
+        otype = action.get("type") or action.get("order_type")
+        price = action.get("price")
+        size = action.get("size_fraction") or action.get("quantity") or action.get("qty_fraction")
+        try:
+            size = float(size) if size is not None else None
+        except Exception:
+            size = None
+        parts = [p for p in [side, otype] if p]
+        line = "Action: " + " ".join(parts)
+        if price is not None:
+            try:
+                line += f" @ {float(price):.4f}"
+            except Exception:
+                line += f" @ {price}"
+        if size is not None:
+            line += f" size={size:.2f}"
+        lines.append(line)
+    pred = llm.get("price_prediction")
+    horizon = llm.get("prediction_horizon_min")
+    conv = llm.get("conviction")
+    if pred is not None:
+        try:
+            pred_val = float(pred)
+            pred_line = f"Prediction: {pred_val:.4f}"
+        except Exception:
+            pred_line = f"Prediction: {pred}"
+        if horizon:
+            pred_line += f" in {horizon}m"
+        if conv is not None:
+            try:
+                pred_line += f" (conv {float(conv):.2f})"
+            except Exception:
+                pass
+        lines.append(pred_line)
+    preds = llm.get("predictions")
+    if isinstance(preds, list) and preds:
+        for item in preds[:3]:
+            if not isinstance(item, dict):
+                continue
+            p = item.get("price_prediction")
+            h = item.get("prediction_horizon_min")
+            c = item.get("conviction")
+            if p is None:
+                continue
+            try:
+                p = float(p)
+                line = f"Alt: {p:.4f}"
+            except Exception:
+                line = f"Alt: {p}"
+            if h:
+                line += f" in {h}m"
+            if c is not None:
+                try:
+                    line += f" (conv {float(c):.2f})"
+                except Exception:
+                    pass
+            lines.append(line)
+    plan = llm.get("trade_plan")
+    if isinstance(plan, dict) and plan:
+        lines.append("Plan:")
+        entry_type = plan.get("entry_type")
+        entry_price = plan.get("entry_price")
+        exit_type = plan.get("exit_type")
+        exit_price = plan.get("exit_price")
+        inv = plan.get("invalidation_price")
+        horizon_min = plan.get("horizon_min")
+        status = plan.get("status")
+        if entry_type or entry_price is not None:
+            line = f"Entry: {entry_type or 'MARKET'}"
+            if entry_price is not None:
+                try:
+                    line += f" @ {float(entry_price):.4f}"
+                except Exception:
+                    line += f" @ {entry_price}"
+            lines.append(line)
+        if exit_type or exit_price is not None:
+            line = f"Exit: {exit_type or 'MARKET'}"
+            if exit_price is not None:
+                try:
+                    line += f" @ {float(exit_price):.4f}"
+                except Exception:
+                    line += f" @ {exit_price}"
+            lines.append(line)
+        if inv is not None:
+            try:
+                lines.append(f"Invalidation: {float(inv):.4f}")
+            except Exception:
+                lines.append(f"Invalidation: {inv}")
+        if horizon_min:
+            lines.append(f"Horizon: {horizon_min}m")
+        if status:
+            lines.append(f"Status: {status}")
+        notes = plan.get("notes")
+        if notes:
+            lines.append(f"Notes: {str(notes)[:120]}")
+    reason = llm.get("reason")
+    if reason:
+        lines.append(f"Rationale: {str(reason)[:140]}")
+    return lines
 _loading_spin_index = 0
 _loading_spin_last = 0.0
 _win_count = 0
@@ -2893,6 +3239,9 @@ while True:
                     risk_state=risk_state,
                     wallet_state=wallet_state
                 )
+                plan_record = None
+                if isinstance(llm_result, dict):
+                    plan_record = _build_trade_plan(symbol, llm_result, last_price, last_candle_close_ts, now)
                 latest_llm_symbol = symbol
                 latest_llm_ts = time.strftime("%H:%M:%S")
                 latest_llm_sentiment = sentiment_score
@@ -2911,6 +3260,7 @@ while True:
                         "prediction_horizon_min": llm_result.get("prediction_horizon_min"),
                         "conviction": llm_result.get("conviction"),
                         "predictions": llm_result.get("predictions"),
+                        "trade_plan": plan_record,
                         "exit": llm_result.get("exit"),
                         "order_action": llm_result.get("order_action"),
                         "reason": llm_result.get("reason"),
@@ -2979,12 +3329,35 @@ while True:
             # D. Execution Routing
             raw_action = current_llm.get("order_action")
             confidence = float(current_llm.get("confidence", 0.0) or 0.0)
+            plan = _trade_plans.get(symbol)
+            if plan and _plan_is_invalid(plan, last_price, now):
+                try:
+                    _append_trade_plan({
+                        "event": "plan_invalid",
+                        **plan,
+                        "invalidate_ts": now,
+                        "last_price": last_price
+                    })
+                except Exception:
+                    pass
+                _trade_plans.pop(symbol, None)
+                plan = None
             if raw_action and confidence < effective_min_conf:
                 if DEBUG_LOG_ATTEMPTS or DEBUG_STATUS:
                     print(f"[LLM] {symbol} action below confidence threshold {confidence:.3f} < {effective_min_conf:.3f} | action={raw_action}")
                 if DEBUG_LOG_ATTEMPTS:
                     _record_attempt(symbol, None, "SKIPPED", "LOW_CONFIDENCE")
             if raw_action and EXECUTION_MODE in ("live", "sim") and confidence >= effective_min_conf:
+                if plan:
+                    raw_action, plan_reason = _apply_trade_plan(plan, raw_action, last_price)
+                    if raw_action is None:
+                        if DEBUG_LOG_ATTEMPTS or DEBUG_STATUS:
+                            print(f"[PLAN] {symbol} action skipped: {plan_reason}")
+                        if DEBUG_LOG_ATTEMPTS:
+                            _record_attempt(symbol, None, "SKIPPED", plan_reason)
+                        if isinstance(current_llm, dict):
+                            current_llm["order_action"] = None
+                        continue
                 # Allow exits even when risk guard blocks new entries
                 action_intent = None
                 if isinstance(raw_action, dict):
@@ -3364,6 +3737,13 @@ while True:
                         if res.get("status") in ("REJECTED", "ERROR"):
                             reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                         if res.get("status") not in ("REJECTED", "ERROR"):
+                            if plan:
+                                try:
+                                    plan["status"] = "executed"
+                                    plan["executed_ts"] = now
+                                    _append_trade_plan({"event": "plan_executed", **plan})
+                                except Exception:
+                                    pass
                             # Clear cached action only after a successful submit
                             if isinstance(current_llm, dict):
                                 current_llm["order_action"] = None
@@ -3609,6 +3989,16 @@ while True:
                         f"avg_conv={opp.get('avg_prediction_conviction', 0.0):.2f} "
                         f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
                     )
+                    fee = opp.get("fee_summary") or {}
+                    if fee:
+                        prompt_lines.append(
+                            "Fees(D): "
+                            f"trades={fee.get('trades', 0)} "
+                            f"gross={fee.get('gross', 0.0):.2f} "
+                            f"net={fee.get('net', 0.0):.2f} "
+                            f"fees={fee.get('fees', 0.0):.2f} "
+                            f"slip={fee.get('slippage', 0.0):.2f}"
+                        )
             except Exception:
                 pass
             try:
@@ -3624,6 +4014,14 @@ while True:
                         f"avg_conv={wk.get('avg_prediction_conviction', 0.0):.2f} "
                         f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
                     )
+                    fee = wk.get("fee_summary") or {}
+                    if fee:
+                        prompt_lines.append(
+                            "Fees(W): "
+                            f"trades={fee.get('trades', 0)} "
+                            f"net={fee.get('net', 0.0):.2f} "
+                            f"fees={fee.get('fees', 0.0):.2f}"
+                        )
             except Exception:
                 pass
             try:
@@ -3639,6 +4037,14 @@ while True:
                         f"avg_conv={mo.get('avg_prediction_conviction', 0.0):.2f} "
                         f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
                     )
+                    fee = mo.get("fee_summary") or {}
+                    if fee:
+                        prompt_lines.append(
+                            "Fees(M): "
+                            f"trades={fee.get('trades', 0)} "
+                            f"net={fee.get('net', 0.0):.2f} "
+                            f"fees={fee.get('fees', 0.0):.2f}"
+                        )
             except Exception:
                 pass
             try:
@@ -3654,6 +4060,14 @@ while True:
                         f"avg_conv={yr.get('avg_prediction_conviction', 0.0):.2f} "
                         f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
                     )
+                    fee = yr.get("fee_summary") or {}
+                    if fee:
+                        prompt_lines.append(
+                            "Fees(Y): "
+                            f"trades={fee.get('trades', 0)} "
+                            f"net={fee.get('net', 0.0):.2f} "
+                            f"fees={fee.get('fees', 0.0):.2f}"
+                        )
             except Exception:
                 pass
             try:
@@ -3734,6 +4148,7 @@ while True:
             if _loading_spin_last:
                 print("\r[UI] Loading dashboard... done.   ")
         _ensure_position_risk_defaults(trader)
+        strategy_text = _build_strategy_text()
         plotter.update(
             prices,
             sentiments,
@@ -3743,6 +4158,7 @@ while True:
             orders=orders_payload,
             attempted_orders=attempted_orders,
             prompt_text=prompt_text,
+            strategy_text=strategy_text,
             status_mode=display_mode,
             status_style=display_style,
             status_flags=status_flags,

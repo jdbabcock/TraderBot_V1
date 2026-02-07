@@ -355,6 +355,32 @@ def llm_decision(
             cleaned_preds.append(payload)
         return cleaned_preds
 
+    def _sanitize_trade_plan(plan):
+        if not isinstance(plan, dict):
+            return None
+        def _norm_type(val):
+            t = str(val or "").strip().upper()
+            return t if t in ("LIMIT", "MARKET") else None
+        def _opt_float(val):
+            try:
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    return None
+                return float(val)
+            except Exception:
+                return None
+        cleaned_plan = {
+            "entry_type": _norm_type(plan.get("entry_type") or plan.get("entry_order_type")),
+            "entry_price": _opt_float(plan.get("entry_price")),
+            "exit_type": _norm_type(plan.get("exit_type") or plan.get("exit_order_type")),
+            "exit_price": _opt_float(plan.get("exit_price")),
+            "invalidation_price": _opt_float(plan.get("invalidation_price")),
+            "horizon_min": _opt_float(plan.get("horizon_min") or plan.get("prediction_horizon_min")),
+            "notes": str(plan.get("notes") or plan.get("reason") or "").strip()[:200]
+        }
+        if not any(v is not None and v != "" for v in cleaned_plan.values()):
+            return None
+        return cleaned_plan
+
     def _sanitize_llm_output(output):
         if not isinstance(output, dict):
             output = {}
@@ -410,6 +436,10 @@ def llm_decision(
             if "size_fraction" not in order_action and order_action.get("quantity_fraction"):
                 order_action["size_fraction"] = order_action.get("quantity_fraction")
         cleaned["order_action"] = order_action
+        plan_raw = output.get("trade_plan")
+        if plan_raw is None:
+            plan_raw = output.get("plan")
+        cleaned["trade_plan"] = _sanitize_trade_plan(plan_raw)
         cleaned["schema_version"] = LLM_SCHEMA_VERSION
         return cleaned
 
@@ -505,12 +535,13 @@ def llm_decision(
             "Prefer LIMIT orders for entries and planned exits; include a limit price. "
             "Use MARKET orders only for urgent exits or extreme volatility. "
             "When providing order_action, include type (LIMIT or MARKET) and price for LIMIT.\n"
+            "Also include trade_plan with keys: entry_type, entry_price, exit_type, exit_price, invalidation_price, horizon_min, notes.\n"
             "Provide price_prediction (target price), prediction_horizon_min (minutes), and conviction (0-1). "
             "Also include predictions as a list for horizons 60m, 1440m (1d), and 10080m (1w). "
             "Use conviction to justify holding through temporary drawdowns with wider stops.\n"
             "Only include order_action when you truly want to trade; confidence is informational and there is no external confidence filter.\n"
             "Return ONLY a JSON object with keys:\n"
-            "confidence (0–1), size_fraction (0–1), stop_loss_pct, take_profit_pct, trailing_stop_pct, price_prediction, prediction_horizon_min, conviction, predictions (list), exit (bool), reason (short string), "
+            "confidence (0–1), size_fraction (0–1), stop_loss_pct, take_profit_pct, trailing_stop_pct, price_prediction, prediction_horizon_min, conviction, predictions (list), trade_plan (object), exit (bool), reason (short string), "
             "pattern_reason (short string explaining any candle pattern usage), order_action (object or null), fill_rate_scale (0.5-2.0), "
             "fill_spread_sensitivity (0.5-2.0), fill_vol_sensitivity (0.5-2.0)"
         )

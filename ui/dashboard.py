@@ -48,6 +48,8 @@ class RealTimeEquityPlot:
         self._text_refresh_interval = 2.0
         self._prompt_refresh_last = 0.0
         self._prompt_refresh_interval = 3.0
+        self._strategy_refresh_last = 0.0
+        self._strategy_refresh_interval = 3.0
         self._chart_refresh_last = 0.0
         self._chart_refresh_interval = 2.0
         self._ui_update_last = 0.0
@@ -436,6 +438,28 @@ class RealTimeEquityPlot:
             btn.pack(side=tk.LEFT, padx=4)
             self.range_buttons[label] = btn
         self._update_range_buttons()
+
+        # -----------------------------
+        # Strategy frame
+        # -----------------------------
+        self.strategy_frame = tk.LabelFrame(self.container, text="Strategy", padx=10, pady=5, bg=self.panel, fg=self.text)
+        self.strategy_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.strategy_scroll = tk.Scrollbar(self.strategy_frame)
+        self.strategy_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.strategy_text = tk.Text(
+            self.strategy_frame,
+            height=6,
+            width=90,
+            yscrollcommand=self.strategy_scroll.set,
+            bg=self.panel,
+            fg=self.text,
+            insertbackground=self.text,
+            wrap="word"
+        )
+        self.strategy_text.pack(fill=tk.BOTH, expand=True)
+        self.strategy_scroll.config(command=self.strategy_text.yview)
+        self.strategy_text.tag_configure("STRATEGY", foreground="#f59e0b")
+        self._divider(self.container)
 
         # -----------------------------
         # Open positions frame
@@ -1258,7 +1282,7 @@ class RealTimeEquityPlot:
         except Exception:
             pass
 
-    def update(self, live_prices, sentiments=None, indicators=None, account_info=None, wallet_snapshot=None, orders=None, attempted_orders=None, prompt_text=None, status_mode=None, status_style=None, status_flags=None, rss_last_ts=None, price_timestamps=None):
+    def update(self, live_prices, sentiments=None, indicators=None, account_info=None, wallet_snapshot=None, orders=None, attempted_orders=None, prompt_text=None, strategy_text=None, status_mode=None, status_style=None, status_flags=None, rss_last_ts=None, price_timestamps=None):
         self.live_prices = live_prices
         self.sentiments = sentiments or {}
         self.market_indicators = indicators or {}
@@ -1718,6 +1742,26 @@ class RealTimeEquityPlot:
                         self.prompt_text.insert(tk.END, line)
                 self.prompt_text.see(tk.END)
                 self._prompt_refresh_last = now
+
+        if self.strategy_text is not None and strategy_text is not None and (now - self._strategy_refresh_last) >= self._strategy_refresh_interval:
+            if isinstance(strategy_text, (list, tuple)):
+                self.strategy_text.delete("1.0", tk.END)
+                for line in strategy_text:
+                    line = str(line)
+                    tag = None
+                    if line.startswith(("Plan", "Entry", "Exit", "Invalidation", "Horizon", "Status")):
+                        tag = "STRATEGY"
+                    if tag:
+                        self.strategy_text.insert(tk.END, line + "\n", tag)
+                    else:
+                        self.strategy_text.insert(tk.END, line + "\n")
+                self.strategy_text.see(tk.END)
+                self._strategy_refresh_last = now
+            else:
+                self.strategy_text.delete("1.0", tk.END)
+                self.strategy_text.insert(tk.END, str(strategy_text))
+                self.strategy_text.see(tk.END)
+                self._strategy_refresh_last = now
             else:
                 if isinstance(prompt_text, dict):
                     prompt_text = "\n".join([f"{k}: {v}" for k, v in prompt_text.items()])
