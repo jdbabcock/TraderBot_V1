@@ -1749,7 +1749,7 @@ class RealTimeEquityPlot:
                 for line in strategy_text:
                     line = str(line)
                     tag = None
-                    if line.startswith(("Plan", "Entry", "Exit", "Invalidation", "Horizon", "Status")):
+                    if line.startswith(("Plan", "Entry", "Exit", "Invalidation", "Horizon", "Status", "Objective", "Decision Budget")):
                         tag = "STRATEGY"
                     if tag:
                         self.strategy_text.insert(tk.END, line + "\n", tag)

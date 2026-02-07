@@ -1532,6 +1532,12 @@ _symbol_exposure_log_state = {}
 SYMBOL_EXPOSURE_LOG_INTERVAL_SECONDS = 30
 _reject_backoff_log_state = {}
 REJECT_BACKOFF_LOG_INTERVAL_SECONDS = 20
+_reject_streak = {}
+_quarantine_until = {}
+_quarantine_log_state = {}
+QUARANTINE_REJECT_LIMIT = 4
+QUARANTINE_SECONDS = 300
+QUARANTINE_LOG_INTERVAL_SECONDS = 30
 _auto_exit_log_state = {}
 AUTO_EXIT_LOG_INTERVAL_SECONDS = 30
 _rebalance_log_state = {}
@@ -1550,6 +1556,8 @@ TRADE_OUTCOMES_PATH = os.path.join("logs", "trade_outcomes.jsonl")
 PRICE_HISTORY_PATH = os.path.join("logs", "price_history.jsonl")
 LLM_PREDICTIONS_PATH = os.path.join("logs", "llm_predictions.jsonl")
 TRADE_PLANS_PATH = os.path.join("logs", "llm_trade_plans.jsonl")
+LLM_OBJECTIVE_PATH = os.path.join("data", "llm_objective.json")
+LLM_OBJECTIVE_HISTORY_PATH = os.path.join("logs", "llm_objective_history.jsonl")
 _trade_trackers = {}
 _trade_plans = {}
 _last_price_history_ts = 0.0
@@ -1562,6 +1570,11 @@ _monthly_opportunity_summary = {}
 _last_opportunity_month = None
 _yearly_opportunity_summary = {}
 _last_opportunity_year = None
+_priority_cache = {"ts": 0.0, "symbols": []}
+MAX_ACTIONS_PER_CANDLE = 2
+_llm_priority_limit = None
+_portfolio_objective = "Maximize risk-adjusted equity growth while minimizing fee-dominated trades."
+_objective_state_cache = {"objective": None, "limit": None}
 
 def _timeframe_to_seconds(timeframe):
     tf = str(timeframe or "").strip().lower()
@@ -1605,6 +1618,105 @@ def _append_trade_plan(record):
             f.write(json.dumps(record) + "\n")
     except Exception:
         pass
+
+def _load_trade_plans_from_log():
+    path = TRADE_PLANS_PATH
+    if not os.path.exists(path):
+        return
+    latest = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                symbol = rec.get("symbol")
+                if not symbol:
+                    continue
+                event = rec.get("event") or "plan_update"
+                if event in ("plan_invalid", "plan_executed"):
+                    latest.pop(symbol, None)
+                    continue
+                if event == "plan_update":
+                    latest[symbol] = rec
+    except Exception:
+        return
+    for symbol, plan in latest.items():
+        try:
+            plan["status"] = "restored"
+        except Exception:
+            pass
+        _trade_plans[symbol] = plan
+
+def _bump_reject_streak(symbol, now_ts):
+    if not symbol:
+        return
+    count = _reject_streak.get(symbol, 0) + 1
+    _reject_streak[symbol] = count
+    if count >= QUARANTINE_REJECT_LIMIT:
+        _quarantine_until[symbol] = now_ts + QUARANTINE_SECONDS
+        _reject_streak[symbol] = 0
+
+def _clear_reject_streak(symbol):
+    if not symbol:
+        return
+    _reject_streak.pop(symbol, None)
+    _quarantine_until.pop(symbol, None)
+
+def _load_llm_objective_state():
+    global _llm_priority_limit, _portfolio_objective, _objective_state_cache
+    path = LLM_OBJECTIVE_PATH
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        obj = data.get("portfolio_objective")
+        limit = data.get("max_actions_per_candle")
+        if obj:
+            _portfolio_objective = str(obj).strip()[:200]
+        if limit is not None:
+            try:
+                _llm_priority_limit = int(round(float(limit)))
+            except Exception:
+                pass
+        _objective_state_cache["objective"] = _portfolio_objective
+        _objective_state_cache["limit"] = _llm_priority_limit
+    except Exception:
+        pass
+
+def _persist_llm_objective_state(force=False):
+    obj = _portfolio_objective
+    limit = _llm_priority_limit
+    if not force:
+        if _objective_state_cache.get("objective") == obj and _objective_state_cache.get("limit") == limit:
+            return
+    try:
+        os.makedirs(os.path.dirname(LLM_OBJECTIVE_PATH), exist_ok=True)
+        payload = {
+            "ts": time.time(),
+            "portfolio_objective": obj,
+            "max_actions_per_candle": limit
+        }
+        with open(LLM_OBJECTIVE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        try:
+            os.makedirs(os.path.dirname(LLM_OBJECTIVE_HISTORY_PATH), exist_ok=True)
+            with open(LLM_OBJECTIVE_HISTORY_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception:
+            pass
+        _objective_state_cache["objective"] = obj
+        _objective_state_cache["limit"] = limit
+    except Exception:
+        pass
+
+_load_llm_objective_state()
+_load_trade_plans_from_log()
 
 def _normalize_plan_type(value):
     t = str(value or "").strip().upper()
@@ -2430,6 +2542,10 @@ def _build_strategy_text():
     if not sym:
         return ["Waiting for LLM decision..."]
     lines.append(f"Symbol: {sym}")
+    if _portfolio_objective:
+        lines.append(f"Objective: {str(_portfolio_objective)[:160]}")
+    if _llm_priority_limit:
+        lines.append(f"Decision Budget: max_actions_per_candle={int(_llm_priority_limit)}")
     llm = latest_llm_summary or {}
     action = llm.get("order_action") or {}
     if isinstance(action, dict) and action:
@@ -2533,6 +2649,79 @@ def _build_strategy_text():
     if reason:
         lines.append(f"Rationale: {str(reason)[:140]}")
     return lines
+
+def _score_llm_candidate(symbol, llm_result, last_price):
+    if not isinstance(llm_result, dict):
+        return None
+    if last_price is None:
+        return None
+    try:
+        lp = float(last_price)
+    except Exception:
+        return None
+    if lp <= 0:
+        return None
+    conf = llm_result.get("confidence")
+    try:
+        conf = float(conf) if conf is not None else 0.0
+    except Exception:
+        conf = 0.0
+    if conf <= 0:
+        return None
+    pred = llm_result.get("price_prediction")
+    edge_pct = 0.0
+    if pred is not None:
+        try:
+            pred = float(pred)
+            edge_pct = abs(pred - lp) / lp
+        except Exception:
+            edge_pct = 0.0
+    conv = llm_result.get("conviction")
+    try:
+        conv = float(conv) if conv is not None else 0.0
+    except Exception:
+        conv = 0.0
+    fee_drag = (KRAKEN_TAKER_FEE_PCT * 2.0) + ESTIMATED_SLIPPAGE_PCT
+    score = (edge_pct * (0.5 + max(0.0, conv))) - fee_drag
+    score *= max(0.0, conf)
+    return score
+
+def _select_priority_symbols(llm_outputs, prices, now_ts):
+    if not isinstance(llm_outputs, dict):
+        return []
+    cache = _priority_cache
+    if (now_ts - cache.get("ts", 0.0)) < 1.0 and cache.get("symbols"):
+        return cache.get("symbols") or []
+    candidates = []
+    for sym, result in llm_outputs.items():
+        if not isinstance(result, dict):
+            continue
+        if not result.get("order_action"):
+            continue
+        ts = result.get("_ts")
+        if ts is None:
+            continue
+        try:
+            ts = float(ts)
+        except Exception:
+            continue
+        if (now_ts - ts) > max(120.0, float(LLM_CHECK_INTERVAL) * 2.0):
+            continue
+        score = _score_llm_candidate(sym, result, (prices or {}).get(sym))
+        if score is None:
+            continue
+        candidates.append((score, sym))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    limit = _llm_priority_limit if _llm_priority_limit is not None else MAX_ACTIONS_PER_CANDLE
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = MAX_ACTIONS_PER_CANDLE
+    limit = max(1, min(5, limit))
+    selected = [sym for _, sym in candidates[:limit]]
+    cache["ts"] = now_ts
+    cache["symbols"] = selected
+    return selected
 _loading_spin_index = 0
 _loading_spin_last = 0.0
 _win_count = 0
@@ -3250,6 +3439,19 @@ while True:
                 latest_llm_risk = risk_state
                 latest_llm_wallet = wallet_state
                 if isinstance(llm_result, dict):
+                    try:
+                        max_actions = llm_result.get("max_actions_per_candle")
+                        if max_actions is not None:
+                            _llm_priority_limit = int(round(float(max_actions)))
+                    except Exception:
+                        pass
+                    try:
+                        obj = llm_result.get("portfolio_objective")
+                        if obj:
+                            _portfolio_objective = str(obj).strip()[:200]
+                    except Exception:
+                        pass
+                    _persist_llm_objective_state()
                     latest_llm_summary = {
                         "confidence": llm_result.get("confidence"),
                         "size_fraction": llm_result.get("size_fraction"),
@@ -3261,6 +3463,8 @@ while True:
                         "conviction": llm_result.get("conviction"),
                         "predictions": llm_result.get("predictions"),
                         "trade_plan": plan_record,
+                        "max_actions_per_candle": llm_result.get("max_actions_per_candle"),
+                        "portfolio_objective": llm_result.get("portfolio_objective"),
                         "exit": llm_result.get("exit"),
                         "order_action": llm_result.get("order_action"),
                         "reason": llm_result.get("reason"),
@@ -3348,6 +3552,11 @@ while True:
                 if DEBUG_LOG_ATTEMPTS:
                     _record_attempt(symbol, None, "SKIPPED", "LOW_CONFIDENCE")
             if raw_action and EXECUTION_MODE in ("live", "sim") and confidence >= effective_min_conf:
+                priority_symbols = _select_priority_symbols(llm_outputs, prices, now)
+                if priority_symbols and symbol not in priority_symbols:
+                    if DEBUG_LOG_ATTEMPTS:
+                        _record_attempt(symbol, None, "SKIPPED", "PRIORITY_GATE")
+                    continue
                 if plan:
                     raw_action, plan_reason = _apply_trade_plan(plan, raw_action, last_price)
                     if raw_action is None:
@@ -3505,6 +3714,12 @@ while True:
                 if trades_today >= MAX_TRADES_PER_DAY:
                     _record_attempt(symbol, None, "BLOCKED", "MAX_TRADES_PER_DAY")
                     continue
+                if now < _quarantine_until.get(symbol, 0.0):
+                    last_q = _quarantine_log_state.get(symbol, 0.0)
+                    if (now - last_q) >= QUARANTINE_LOG_INTERVAL_SECONDS:
+                        _record_attempt(symbol, None, "BLOCKED", "REJECT_QUARANTINE")
+                        _quarantine_log_state[symbol] = now
+                    continue
                 if now < reject_backoff_until.get(symbol, 0.0):
                     last_rej = _reject_backoff_log_state.get(symbol, 0.0)
                     if (now - last_rej) >= REJECT_BACKOFF_LOG_INTERVAL_SECONDS:
@@ -3561,6 +3776,7 @@ while True:
                                     if new_qty <= 0:
                                         reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                         _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "INSUFFICIENT_CASH", qty=action.get("quantity"), price=order_price)
+                                        _bump_reject_streak(symbol, now)
                                         continue
                                     action["quantity"] = new_qty
                                     if DEBUG_STATUS or DEBUG_LOG_ATTEMPTS:
@@ -3585,10 +3801,12 @@ while True:
                                         else:
                                             reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                             _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "KRAKEN_MIN_SIZE", qty=v_qty, price=order_price)
+                                            _bump_reject_streak(symbol, now)
                                             continue
                                     else:
                                         reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                         _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "KRAKEN_MIN_SIZE", qty=v_qty, price=order_price)
+                                        _bump_reject_streak(symbol, now)
                                         continue
                             notional = float(order_price or 0.0) * float(v_qty or 0.0)
                             if action.get("side", "").upper() == "BUY" and available_cash is not None:
@@ -3596,10 +3814,12 @@ while True:
                                 if max_notional > 0 and notional > max_notional:
                                     reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                     _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "INSUFFICIENT_CASH", qty=v_qty, price=order_price)
+                                    _bump_reject_streak(symbol, now)
                                     continue
                             if notional < MIN_NOTIONAL or v_qty <= 0:
                                 reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                 _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "LOCAL_MIN_NOTIONAL", qty=v_qty, price=order_price)
+                                _bump_reject_streak(symbol, now)
                                 _log_order_action(
                                     action.get("symbol", symbol),
                                     action,
@@ -3625,6 +3845,7 @@ while True:
                                     if new_qty <= 0:
                                         reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                         _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "INSUFFICIENT_CASH", qty=action.get("quantity"), price=order_price)
+                                        _bump_reject_streak(symbol, now)
                                         continue
                                     action["quantity"] = new_qty
                                     if DEBUG_STATUS or DEBUG_LOG_ATTEMPTS:
@@ -3633,6 +3854,7 @@ while True:
                             if notional < MIN_NOTIONAL or float(action.get("quantity") or 0.0) <= 0:
                                 reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
                                 _record_attempt(action.get("symbol", symbol), action.get("side"), "REJECTED", "LOCAL_MIN_NOTIONAL", qty=action.get("quantity"), price=order_price)
+                                _bump_reject_streak(symbol, now)
                                 _log_order_action(
                                     action.get("symbol", symbol),
                                     action,
@@ -3736,7 +3958,9 @@ while True:
                         _autopilot_on_realized_pnl(realized_pnl_net if realized_pnl_net is not None else realized_pnl, symbol=log_symbol)
                         if res.get("status") in ("REJECTED", "ERROR"):
                             reject_backoff_until[symbol] = now + REJECT_BACKOFF_SECONDS
+                            _bump_reject_streak(log_symbol, now)
                         if res.get("status") not in ("REJECTED", "ERROR"):
+                            _clear_reject_streak(log_symbol)
                             if plan:
                                 try:
                                     plan["status"] = "executed"
@@ -3954,6 +4178,19 @@ while True:
                 )
             except Exception:
                 prompt_lines.append(f"Risk: {latest_llm_risk}")
+            try:
+                obj = latest_llm_summary.get("portfolio_objective") if isinstance(latest_llm_summary, dict) else None
+                if not obj:
+                    obj = _portfolio_objective
+                if obj:
+                    prompt_lines.append(f"Objective: {str(obj)[:160]}")
+            except Exception:
+                pass
+            try:
+                if _llm_priority_limit:
+                    prompt_lines.append(f"Decision Budget: max_actions_per_candle={int(_llm_priority_limit)}")
+            except Exception:
+                pass
             try:
                 wins = latest_llm_perf.get("wins")
                 losses = latest_llm_perf.get("losses")

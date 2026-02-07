@@ -73,7 +73,9 @@ LLM_DEFAULTS = {
     "order_action": None,
     "fill_rate_scale": 1.0,
     "fill_spread_sensitivity": 1.0,
-    "fill_vol_sensitivity": 1.0
+    "fill_vol_sensitivity": 1.0,
+    "max_actions_per_candle": 2,
+    "portfolio_objective": ""
 }
 LLM_BOUNDS = {
     "confidence": (0.0, 1.0),
@@ -85,7 +87,8 @@ LLM_BOUNDS = {
     "prediction_horizon_min": (5, 10080),
     "fill_rate_scale": (0.5, 2.0),
     "fill_spread_sensitivity": (0.5, 2.0),
-    "fill_vol_sensitivity": (0.5, 2.0)
+    "fill_vol_sensitivity": (0.5, 2.0),
+    "max_actions_per_candle": (1, 5)
 }
 LLM_LOG_PATH = "llm_activity.log"
 
@@ -421,6 +424,14 @@ def llm_decision(
         cleaned["fill_spread_sensitivity"] = _clamp(cleaned["fill_spread_sensitivity"], *LLM_BOUNDS["fill_spread_sensitivity"])
         cleaned["fill_vol_sensitivity"] = _safe_float(output.get("fill_vol_sensitivity", LLM_DEFAULTS["fill_vol_sensitivity"]), LLM_DEFAULTS["fill_vol_sensitivity"])
         cleaned["fill_vol_sensitivity"] = _clamp(cleaned["fill_vol_sensitivity"], *LLM_BOUNDS["fill_vol_sensitivity"])
+        max_actions = _safe_float(output.get("max_actions_per_candle", LLM_DEFAULTS["max_actions_per_candle"]), LLM_DEFAULTS["max_actions_per_candle"])
+        try:
+            max_actions = int(round(float(max_actions)))
+        except Exception:
+            max_actions = LLM_DEFAULTS["max_actions_per_candle"]
+        max_actions = max(LLM_BOUNDS["max_actions_per_candle"][0], min(LLM_BOUNDS["max_actions_per_candle"][1], max_actions))
+        cleaned["max_actions_per_candle"] = max_actions
+        cleaned["portfolio_objective"] = str(output.get("portfolio_objective", LLM_DEFAULTS["portfolio_objective"]))
         order_action = output.get("order_action")
         # Normalize LLM action schema variants
         if isinstance(order_action, dict):
@@ -462,6 +473,8 @@ def llm_decision(
             "size_fraction": random.uniform(0.05, 0.3),
             "stop_loss_pct": 0.01,
             "take_profit_pct": 0.02,
+            "max_actions_per_candle": 2,
+            "portfolio_objective": "Maximize risk-adjusted equity growth while minimizing fee-dominated trades.",
             "exit": False,
             "reason": "token_free_or_disabled"
         })
@@ -536,11 +549,14 @@ def llm_decision(
             "Use MARKET orders only for urgent exits or extreme volatility. "
             "When providing order_action, include type (LIMIT or MARKET) and price for LIMIT.\n"
             "Also include trade_plan with keys: entry_type, entry_price, exit_type, exit_price, invalidation_price, horizon_min, notes.\n"
+            "Set max_actions_per_candle (1-5) to limit simultaneous portfolio actions based on volatility and edge.\n"
+            "Provide portfolio_objective as a short sentence describing the current portfolio goal.\n"
             "Provide price_prediction (target price), prediction_horizon_min (minutes), and conviction (0-1). "
             "Also include predictions as a list for horizons 60m, 1440m (1d), and 10080m (1w). "
             "Use conviction to justify holding through temporary drawdowns with wider stops.\n"
             "Only include order_action when you truly want to trade; confidence is informational and there is no external confidence filter.\n"
             "Return ONLY a JSON object with keys:\n"
+            "Include max_actions_per_candle (int) and portfolio_objective (string).\n"
             "confidence (0–1), size_fraction (0–1), stop_loss_pct, take_profit_pct, trailing_stop_pct, price_prediction, prediction_horizon_min, conviction, predictions (list), trade_plan (object), exit (bool), reason (short string), "
             "pattern_reason (short string explaining any candle pattern usage), order_action (object or null), fill_rate_scale (0.5-2.0), "
             "fill_spread_sensitivity (0.5-2.0), fill_vol_sensitivity (0.5-2.0)"
