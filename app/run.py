@@ -844,6 +844,7 @@ def _portfolio_snapshot(trader, prices, account_info, total_notional, per_symbol
         positions = getattr(trader, "positions", {}) or {}
         unrealized_by_symbol = {}
         exposure_by_symbol = {}
+        llm_prediction_by_symbol = {}
         for sym, pos in positions.items():
             price = prices.get(sym) or prices.get(sym.replace("/", "")) or pos.get("entry_price")
             if price is None:
@@ -852,12 +853,28 @@ def _portfolio_snapshot(trader, prices, account_info, total_notional, per_symbol
             size = float(pos.get("size", 0.0) or 0.0)
             unrealized = (float(price) - entry) * size
             unrealized_by_symbol[sym] = unrealized
+            if isinstance(pos, dict):
+                dec = pos.get("llm_decision") or {}
+                if isinstance(dec, dict):
+                    pred = dec.get("price_prediction")
+                    horizon = dec.get("prediction_horizon_min")
+                    conviction = dec.get("conviction")
+                    preds = dec.get("predictions")
+                    if pred is not None or horizon is not None or conviction is not None:
+                        llm_prediction_by_symbol[sym] = {
+                            "price_prediction": pred,
+                            "prediction_horizon_min": horizon,
+                            "conviction": conviction,
+                            "predictions": preds if isinstance(preds, list) else None,
+                            "ts": dec.get("_ts")
+                        }
         if per_symbol_notional:
             for sym, notional in per_symbol_notional.items():
                 exposure_by_symbol[sym] = (float(notional) / float(equity)) if equity else None
         snapshot["unrealized_by_symbol"] = unrealized_by_symbol
         snapshot["exposure_by_symbol"] = exposure_by_symbol
         snapshot["total_exposure_pct"] = (float(total_notional) / float(equity)) if equity else None
+        snapshot["llm_prediction_by_symbol"] = llm_prediction_by_symbol
         # Allocation deviation vs targets
         allocation_deviation = {}
         if TARGET_ALLOCATION:
@@ -906,7 +923,9 @@ def _build_perf_summary(win_count, loss_count, realized_total, trade_count, win_
         "realized_total": realized_total,
         "win_rate": (win_rate if trade_count else 0.0),
         "underperforming": underperforming,
-        "trade_count": trade_count
+        "trade_count": trade_count,
+        "daily_opportunity_summary": _daily_opportunity_summary or {},
+        "weekly_opportunity_summary": _weekly_opportunity_summary or {}
     }
     hist_baseline = _get_historical_baseline()
     if hist_baseline is not None and hist_baseline > 0 and equity is not None:
@@ -1342,6 +1361,8 @@ _symbol_exposure_log_state = {}
 SYMBOL_EXPOSURE_LOG_INTERVAL_SECONDS = 30
 _reject_backoff_log_state = {}
 REJECT_BACKOFF_LOG_INTERVAL_SECONDS = 20
+_auto_exit_log_state = {}
+AUTO_EXIT_LOG_INTERVAL_SECONDS = 30
 _rebalance_log_state = {}
 _rebalance_advice_cache = {}
 _llm_action_log = []
@@ -1354,6 +1375,434 @@ latest_llm_ta = {}
 latest_llm_sentiment = None
 latest_llm_wallet = {}
 latest_llm_ts = None
+TRADE_OUTCOMES_PATH = os.path.join("logs", "trade_outcomes.jsonl")
+PRICE_HISTORY_PATH = os.path.join("logs", "price_history.jsonl")
+LLM_PREDICTIONS_PATH = os.path.join("logs", "llm_predictions.jsonl")
+_trade_trackers = {}
+_last_price_history_ts = 0.0
+_daily_opportunity_summary = {}
+_last_opportunity_day = None
+_last_candle_close_ts = {}
+_weekly_opportunity_summary = {}
+_last_opportunity_week = None
+
+def _timeframe_to_seconds(timeframe):
+    tf = str(timeframe or "").strip().lower()
+    if tf.endswith("m"):
+        try:
+            return int(tf[:-1]) * 60
+        except Exception:
+            return 300
+    if tf.endswith("h"):
+        try:
+            return int(tf[:-1]) * 3600
+        except Exception:
+            return 3600
+    if tf.endswith("d"):
+        try:
+            return int(tf[:-1]) * 86400
+        except Exception:
+            return 86400
+    return 300
+
+def _append_trade_outcome(record):
+    try:
+        os.makedirs(os.path.dirname(TRADE_OUTCOMES_PATH), exist_ok=True)
+        with open(TRADE_OUTCOMES_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+def _append_llm_prediction(record):
+    try:
+        os.makedirs(os.path.dirname(LLM_PREDICTIONS_PATH), exist_ok=True)
+        with open(LLM_PREDICTIONS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+def _log_price_history(prices, now_ts):
+    global _last_price_history_ts
+    if (now_ts - _last_price_history_ts) < 60:
+        return
+    _last_price_history_ts = now_ts
+    try:
+        os.makedirs(os.path.dirname(PRICE_HISTORY_PATH), exist_ok=True)
+        with open(PRICE_HISTORY_PATH, "a", encoding="utf-8") as f:
+            for sym, px in (prices or {}).items():
+                if px is None:
+                    continue
+                f.write(json.dumps({"ts": now_ts, "symbol": sym, "price": float(px)}) + "\n")
+    except Exception:
+        pass
+
+def _update_trade_tracker(symbol, last_price):
+    if symbol not in _trade_trackers:
+        return
+    try:
+        tracker = _trade_trackers[symbol]
+        px = float(last_price) if last_price is not None else None
+        if px is None:
+            return
+        if tracker.get("max_price") is None or px > tracker["max_price"]:
+            tracker["max_price"] = px
+        if tracker.get("min_price") is None or px < tracker["min_price"]:
+            tracker["min_price"] = px
+    except Exception:
+        pass
+
+def _on_trade_open(symbol, entry_price, qty=None):
+    try:
+        px = float(entry_price) if entry_price is not None else None
+        if px is None:
+            return
+        tracker = _trade_trackers.get(symbol)
+        if tracker is None:
+            _trade_trackers[symbol] = {
+                "entry_ts": time.time(),
+                "entry_price": px,
+                "qty": float(qty or 0.0),
+                "max_price": px,
+                "min_price": px
+            }
+        else:
+            tracker["qty"] = float(tracker.get("qty", 0.0) or 0.0) + float(qty or 0.0)
+            tracker["max_price"] = max(tracker.get("max_price", px), px)
+            tracker["min_price"] = min(tracker.get("min_price", px), px)
+    except Exception:
+        pass
+
+def _on_trade_close(symbol, exit_price, reason=None):
+    tracker = _trade_trackers.pop(symbol, None)
+    if not tracker:
+        return
+    try:
+        entry_price = float(tracker.get("entry_price") or 0.0)
+        exit_price = float(exit_price or 0.0)
+        if entry_price <= 0 or exit_price <= 0:
+            return
+        max_price = float(tracker.get("max_price") or entry_price)
+        min_price = float(tracker.get("min_price") or entry_price)
+        mfe_pct = (max_price - entry_price) / entry_price if entry_price else 0.0
+        mae_pct = (entry_price - min_price) / entry_price if entry_price else 0.0
+        record = {
+            "ts": time.time(),
+            "symbol": symbol,
+            "entry_ts": tracker.get("entry_ts"),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "qty": tracker.get("qty"),
+            "mfe_pct": mfe_pct,
+            "mae_pct": mae_pct,
+            "exit_reason": reason or "close"
+        }
+        _append_trade_outcome(record)
+    except Exception:
+        pass
+
+def _compute_daily_opportunity_summary(day_key, symbol_prices, trade_records, predictions):
+    if not trade_records:
+        trade_records = []
+    mfe_list = []
+    mae_list = []
+    post_list = []
+    post_gt_1 = 0
+    for rec in trade_records:
+        mfe_list.append(rec.get("mfe_pct") or 0.0)
+        mae_list.append(rec.get("mae_pct") or 0.0)
+        sym = rec.get("symbol")
+        exit_ts = rec.get("ts")
+        exit_price = rec.get("exit_price")
+        prices = symbol_prices.get(sym, [])
+        if not prices or not exit_ts or not exit_price:
+            continue
+        max_after = None
+        for ts, px in prices:
+            if ts <= exit_ts:
+                continue
+            if max_after is None or px > max_after:
+                max_after = px
+        if max_after is None:
+            continue
+        post_fav = (max_after - exit_price) / exit_price
+        post_list.append(post_fav)
+        if post_fav >= 0.01:
+            post_gt_1 += 1
+    total = len(trade_records)
+    summary = {
+        "day": day_key,
+        "trades": total,
+        "avg_mfe_pct": float(sum(mfe_list) / len(mfe_list)) if mfe_list else 0.0,
+        "avg_mae_pct": float(sum(mae_list) / len(mae_list)) if mae_list else 0.0,
+        "avg_post_exit_fav_pct": float(sum(post_list) / len(post_list)) if post_list else 0.0,
+        "pct_post_exit_fav_gt_1pct": float(post_gt_1 / total) if total else 0.0
+    }
+    pred_count, pred_hits, pred_conv, pred_stats = _compute_prediction_stats(
+        symbol_prices,
+        predictions,
+        end_ts=time.mktime(time.strptime(day_key + " 23:59:59", "%Y-%m-%d %H:%M:%S"))
+    )
+    summary["prediction_count"] = pred_count
+    summary["prediction_hit_rate"] = float(pred_hits / pred_count) if pred_count else 0.0
+    summary["avg_prediction_conviction"] = float(sum(pred_conv) / len(pred_conv)) if pred_conv else 0.0
+    summary["prediction_horizon_stats"] = pred_stats
+    return summary
+
+def _compute_prediction_stats(symbol_prices, predictions, end_ts):
+    pred_count = 0
+    pred_hits = 0
+    pred_conv = []
+    horizon_stats = {}
+    if not predictions:
+        return pred_count, pred_hits, pred_conv, horizon_stats
+    for pred in predictions:
+        sym = pred.get("symbol")
+        ts = pred.get("ts")
+        last_price = pred.get("last_price")
+        if sym is None or ts is None or last_price is None:
+            continue
+        try:
+            ts = float(ts)
+            last_price = float(last_price)
+        except Exception:
+            continue
+        series = symbol_prices.get(sym, [])
+        if not series:
+            continue
+        pred_items = pred.get("predictions")
+        if not isinstance(pred_items, list) or not pred_items:
+            pred_items = [pred]
+        for item in pred_items:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("price_prediction") or pred.get("price_prediction")
+            horizon = item.get("prediction_horizon_min") or pred.get("prediction_horizon_min") or 60
+            conviction = item.get("conviction")
+            if conviction is None:
+                conviction = pred.get("conviction")
+            if target is None:
+                continue
+            try:
+                target = float(target)
+                horizon = int(horizon)
+            except Exception:
+                continue
+            key = str(horizon)
+            bucket = horizon_stats.setdefault(key, {"count": 0, "hits": 0, "conv": []})
+            if conviction is not None:
+                try:
+                    conv_val = float(conviction)
+                    pred_conv.append(conv_val)
+                    bucket["conv"].append(conv_val)
+                except Exception:
+                    pass
+            end_window = ts + (horizon * 60)
+            if end_ts and end_window > end_ts:
+                end_window = end_ts
+            window = [px for t, px in series if t >= ts and t <= end_window]
+            if not window:
+                continue
+            pred_count += 1
+            bucket["count"] += 1
+            if target >= last_price:
+                hit = max(window) >= target
+            else:
+                hit = min(window) <= target
+            if hit:
+                pred_hits += 1
+                bucket["hits"] += 1
+    for key, bucket in list(horizon_stats.items()):
+        count = bucket.get("count") or 0
+        hits = bucket.get("hits") or 0
+        convs = bucket.get("conv") or []
+        horizon_stats[key] = {
+            "count": int(count),
+            "hit_rate": float(hits / count) if count else 0.0,
+            "avg_conv": float(sum(convs) / len(convs)) if convs else 0.0
+        }
+    return pred_count, pred_hits, pred_conv, horizon_stats
+
+def _maybe_daily_opportunity_reflection(now_ts):
+    global _daily_opportunity_summary, _last_opportunity_day
+    local = time.localtime(now_ts)
+    day_key = time.strftime("%Y-%m-%d", local)
+    if _last_opportunity_day == day_key:
+        return
+    if local.tm_hour < 9:
+        return
+    prev_day_ts = now_ts - 86400
+    prev_day_key = time.strftime("%Y-%m-%d", time.localtime(prev_day_ts))
+    trades = []
+    try:
+        if os.path.exists(TRADE_OUTCOMES_PATH):
+            with open(TRADE_OUTCOMES_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    rec_day = time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+                    if rec_day == prev_day_key:
+                        trades.append(rec)
+    except Exception:
+        trades = []
+    symbol_prices = {}
+    try:
+        if os.path.exists(PRICE_HISTORY_PATH):
+            with open(PRICE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = row.get("ts")
+                    sym = row.get("symbol")
+                    px = row.get("price")
+                    if ts is None or sym is None or px is None:
+                        continue
+                    rec_day = time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+                    if rec_day != prev_day_key:
+                        continue
+                    symbol_prices.setdefault(sym, []).append((float(ts), float(px)))
+    except Exception:
+        symbol_prices = {}
+    for sym in symbol_prices:
+        symbol_prices[sym].sort(key=lambda x: x[0])
+    predictions = []
+    try:
+        if os.path.exists(LLM_PREDICTIONS_PATH):
+            with open(LLM_PREDICTIONS_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    rec_day = time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+                    if rec_day == prev_day_key:
+                        predictions.append(rec)
+    except Exception:
+        predictions = []
+    summary = _compute_daily_opportunity_summary(prev_day_key, symbol_prices, trades, predictions)
+    _daily_opportunity_summary = summary
+    _last_opportunity_day = day_key
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(os.path.join("data", "daily_opportunity_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+
+def _maybe_weekly_opportunity_reflection(now_ts):
+    global _weekly_opportunity_summary, _last_opportunity_week
+    local = time.localtime(now_ts)
+    if local.tm_wday != 0 or local.tm_hour < 9:
+        return
+    week_key = time.strftime("%Y-%W", local)
+    if _last_opportunity_week == week_key:
+        return
+    day_start = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, local.tm_wday, local.tm_yday, local.tm_isdst))
+    week_start = day_start - (local.tm_wday * 86400)
+    prev_start = week_start - (7 * 86400)
+    prev_end = week_start - 1
+    week_label = time.strftime("%Y-%W", time.localtime(prev_start))
+
+    trades = []
+    try:
+        if os.path.exists(TRADE_OUTCOMES_PATH):
+            with open(TRADE_OUTCOMES_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        trades.append(rec)
+    except Exception:
+        trades = []
+
+    symbol_prices = {}
+    try:
+        if os.path.exists(PRICE_HISTORY_PATH):
+            with open(PRICE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = row.get("ts")
+                    sym = row.get("symbol")
+                    px = row.get("price")
+                    if ts is None or sym is None or px is None:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        symbol_prices.setdefault(sym, []).append((ts, float(px)))
+    except Exception:
+        symbol_prices = {}
+    for sym in symbol_prices:
+        symbol_prices[sym].sort(key=lambda x: x[0])
+
+    predictions = []
+    try:
+        if os.path.exists(LLM_PREDICTIONS_PATH):
+            with open(LLM_PREDICTIONS_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        predictions.append(rec)
+    except Exception:
+        predictions = []
+
+    summary = _compute_daily_opportunity_summary(
+        week_label,
+        symbol_prices,
+        trades,
+        predictions
+    )
+    summary["week"] = week_label
+    _weekly_opportunity_summary = summary
+    _last_opportunity_week = week_key
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(os.path.join("data", "weekly_opportunity_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
 
 def _append_llm_action_log(message):
     if not message:
@@ -1755,6 +2204,7 @@ while True:
                 continue
             
             last_price = live_prices[symbol]
+            _update_trade_tracker(symbol, last_price)
             # --- SAFEGUARD: Request Staggering ---
             # Wait 200ms between symbols to spread out API weight
             time.sleep(0.2)
@@ -1804,49 +2254,71 @@ while True:
             recent_ohlcv = None
             recent_closes = None
             candle_patterns = None
+            last_candle_close_ts = None
             if not df.empty:
-                recent_ohlcv = (
-                    df[["open", "high", "low", "close", "volume"]]
+                tf_seconds = _timeframe_to_seconds(TIMEFRAME)
+                closed_df = df
+                try:
+                    last_open_ts = df["timestamp"].iloc[-1].timestamp()
+                    if now < (last_open_ts + tf_seconds) and len(df) > 1:
+                        closed_df = df.iloc[:-1]
+                        last_open_ts = closed_df["timestamp"].iloc[-1].timestamp()
+                    last_candle_close_ts = last_open_ts + tf_seconds
+                except Exception:
+                    closed_df = df
+                if closed_df.empty:
+                    recent_ohlcv = None
+                    recent_closes = None
+                    candle_patterns = None
+                else:
+                    recent_ohlcv = (
+                        closed_df[["open", "high", "low", "close", "volume"]]
                     .tail(30)
                     .to_dict(orient="records")
-                )
-                recent_closes = df["close"].tail(30).tolist()
-                candle_patterns = _detect_candle_patterns(df)
-                rsi = ta.momentum.RSIIndicator(df["close"]).rsi().iloc[-1]
-                ema20 = ta.trend.EMAIndicator(df["close"], window=20).ema_indicator().iloc[-1]
-                atr = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"]).average_true_range().iloc[-1]
-                vwap = ta.volume.VolumeWeightedAveragePrice(
-                    df["high"], df["low"], df["close"], df["volume"]
-                ).volume_weighted_average_price().iloc[-1]
-                avg_vol = None
-                current_vol = None
-                vol_ratio = None
-                try:
-                    avg_vol = df["volume"].rolling(window=20).mean().iloc[-1]
-                    current_vol = df["volume"].iloc[-1]
-                    if avg_vol and avg_vol > 0:
-                        vol_ratio = float(current_vol) / float(avg_vol)
-                except Exception:
+                    )
+                    recent_closes = closed_df["close"].tail(30).tolist()
+                    candle_patterns = _detect_candle_patterns(closed_df)
+                    rsi = ta.momentum.RSIIndicator(closed_df["close"]).rsi().iloc[-1]
+                    ema20 = ta.trend.EMAIndicator(closed_df["close"], window=20).ema_indicator().iloc[-1]
+                    atr = ta.volatility.AverageTrueRange(closed_df["high"], closed_df["low"], closed_df["close"]).average_true_range().iloc[-1]
+                    vwap = ta.volume.VolumeWeightedAveragePrice(
+                        closed_df["high"], closed_df["low"], closed_df["close"], closed_df["volume"]
+                    ).volume_weighted_average_price().iloc[-1]
                     avg_vol = None
                     current_vol = None
                     vol_ratio = None
-                indicators[symbol] = {
-                    "rsi": rsi,
-                    "ema": ema20,
-                    "ema20": ema20,
-                    "vwap": vwap,
-                    "vol_ratio": vol_ratio,
-                    "current_vol": current_vol,
-                    "avg_vol": avg_vol,
-                    "atr_pct": (atr/last_price),
-                    "last_update": formatted_time
-                }
+                    try:
+                        avg_vol = closed_df["volume"].rolling(window=20).mean().iloc[-1]
+                        current_vol = closed_df["volume"].iloc[-1]
+                        if avg_vol and avg_vol > 0:
+                            vol_ratio = float(current_vol) / float(avg_vol)
+                    except Exception:
+                        avg_vol = None
+                        current_vol = None
+                        vol_ratio = None
+                    indicators[symbol] = {
+                        "rsi": rsi,
+                        "ema": ema20,
+                        "ema20": ema20,
+                        "vwap": vwap,
+                        "vol_ratio": vol_ratio,
+                        "current_vol": current_vol,
+                        "avg_vol": avg_vol,
+                        "atr_pct": (atr/last_price),
+                        "last_update": formatted_time
+                    }
 
             if not _trading_ready:
                 continue
 
             # C. LLM Decision (Throttled)
             if USE_LLM and (now - last_llm_call[symbol] >= LLM_CHECK_INTERVAL):
+                if last_candle_close_ts is None or now < last_candle_close_ts:
+                    continue
+                last_seen_candle = _last_candle_close_ts.get(symbol)
+                if last_seen_candle == last_candle_close_ts:
+                    continue
+                _last_candle_close_ts[symbol] = last_candle_close_ts
                 sentiment_payload = fetch_sentiment_score(symbol)
                 if isinstance(sentiment_payload, (list, tuple)) and len(sentiment_payload) > 0:
                     sentiment_score = sentiment_payload[0]
@@ -1873,6 +2345,42 @@ while True:
                     "daily_loss_pct": daily_loss_pct
                 }
                 ta_context = _build_ta_context(symbol, indicators, recent_ohlcv, candle_patterns)
+                multi_tf = {}
+                try:
+                    for tf in ("15m", "1h", "4h", "1d"):
+                        df_tf, _ = fetch_ohlcv(
+                            symbol,
+                            tf,
+                            limit=200,
+                            client=getattr(live_execution_client, "client", None),
+                            exchange=EXCHANGE
+                        )
+                        if df_tf is None or df_tf.empty:
+                            continue
+                        tf_seconds = _timeframe_to_seconds(tf)
+                        try:
+                            last_open_tf = df_tf["timestamp"].iloc[-1].timestamp()
+                            if now < (last_open_tf + tf_seconds) and len(df_tf) > 1:
+                                df_tf = df_tf.iloc[:-1]
+                        except Exception:
+                            pass
+                        if df_tf.empty:
+                            continue
+                        patterns_tf = _detect_candle_patterns(df_tf)
+                        rsi_tf = ta.momentum.RSIIndicator(df_tf["close"]).rsi().iloc[-1]
+                        ema_tf = ta.trend.EMAIndicator(df_tf["close"], window=20).ema_indicator().iloc[-1]
+                        atr_tf = ta.volatility.AverageTrueRange(df_tf["high"], df_tf["low"], df_tf["close"]).average_true_range().iloc[-1]
+                        last_close_tf = df_tf["close"].iloc[-1]
+                        trend_tf = "bullish" if last_close_tf >= ema_tf else "bearish"
+                        multi_tf[tf] = {
+                            "trend": trend_tf,
+                            "rsi": float(rsi_tf) if rsi_tf is not None else None,
+                            "ema20": float(ema_tf) if ema_tf is not None else None,
+                            "atr_pct": float(atr_tf / last_close_tf) if last_close_tf else None,
+                            "patterns": patterns_tf
+                        }
+                except Exception:
+                    multi_tf = {}
                 perf_summary = _build_perf_summary(
                     _win_count,
                     _loss_count,
@@ -1892,6 +2400,9 @@ while True:
                     effective_min_conf
                 )
                 execution_context = _build_execution_context(symbol, trades_by_symbol, portfolio_context)
+                execution_context["decision_candle_close_ts"] = last_candle_close_ts
+                if multi_tf:
+                    execution_context["multi_timeframe"] = multi_tf
                 wallet_state = _build_wallet_state(account_info, trader, equity)
                 llm_result = llm_decision(
                     symbol, last_price, sentiment_score, 0.0, trader.positions,
@@ -1924,11 +2435,25 @@ while True:
                         "stop_loss_pct": llm_result.get("stop_loss_pct"),
                         "take_profit_pct": llm_result.get("take_profit_pct"),
                         "trailing_stop_pct": llm_result.get("trailing_stop_pct"),
+                        "price_prediction": llm_result.get("price_prediction"),
+                        "prediction_horizon_min": llm_result.get("prediction_horizon_min"),
+                        "conviction": llm_result.get("conviction"),
+                        "predictions": llm_result.get("predictions"),
                         "exit": llm_result.get("exit"),
                         "order_action": llm_result.get("order_action"),
                         "reason": llm_result.get("reason"),
                         "pattern_reason": llm_result.get("pattern_reason")
                     }
+                    if llm_result.get("price_prediction") is not None or llm_result.get("conviction") is not None:
+                        _append_llm_prediction({
+                            "ts": now,
+                            "symbol": symbol,
+                            "last_price": last_price,
+                            "price_prediction": llm_result.get("price_prediction"),
+                            "prediction_horizon_min": llm_result.get("prediction_horizon_min"),
+                            "conviction": llm_result.get("conviction"),
+                            "predictions": llm_result.get("predictions")
+                        })
                 else:
                     latest_llm_summary = {"decision": "no_result"}
                 if isinstance(llm_result, dict):
@@ -2281,6 +2806,12 @@ while True:
                         res = execute_llm_action(execution_client, action)
                         print(f"🔥 [{EXECUTION_MODE.upper()}] {summary} | Status: {res.get('status', 'SUCCESS')}")
                         _record_attempt(log_symbol, action.get("side"), res.get("status", "SUCCESS"), res.get("info"), qty=action.get("quantity"), price=order_price)
+                        if res.get("status") not in ("REJECTED", "ERROR"):
+                            side = str(action.get("side", "")).upper()
+                            if side == "BUY":
+                                _on_trade_open(_to_slash_symbol(log_symbol), order_price, qty=action.get("quantity"))
+                            elif side == "SELL":
+                                _on_trade_close(_to_slash_symbol(log_symbol), order_price, reason="sell")
                         outcome = None
                         realized_pnl = None
                         if EXECUTION_MODE == "live" and hasattr(trader, "realized_pnl_by_symbol"):
@@ -2356,7 +2887,10 @@ while True:
                 reason = None
                 if isinstance(exit_item, (list, tuple)) and len(exit_item) > 1:
                     reason = exit_item[1]
-                print(f"🛑 [AUTO-EXIT] {s} hit Stop/Target.")
+                last_auto = _auto_exit_log_state.get(s, 0.0)
+                if (now - last_auto) >= AUTO_EXIT_LOG_INTERVAL_SECONDS:
+                    print(f"🛑 [AUTO-EXIT] {s} hit Stop/Target.")
+                    _auto_exit_log_state[s] = now
                 if EXECUTION_MODE == "sim":
                     pos = trader.positions.get(s, {}) if hasattr(trader, "positions") else {}
                     qty = float(pos.get("size", 0.0) or 0.0)
@@ -2376,6 +2910,7 @@ while True:
                         llm_payload=llm_outputs.get(s, {}),
                         last_price=prices.get(s)
                     )
+                    _on_trade_close(_to_slash_symbol(s), prices.get(s), reason="auto_exit")
                     continue
                 try:
                     pos = trader.positions.get(s, {})
@@ -2443,6 +2978,38 @@ while True:
             except Exception:
                 prompt_lines.append(f"Sentiment: {latest_llm_sentiment}")
             try:
+                pred = latest_llm_summary.get("price_prediction")
+                horizon = latest_llm_summary.get("prediction_horizon_min")
+                conv = latest_llm_summary.get("conviction")
+                if pred is not None or horizon is not None or conv is not None:
+                    prompt_lines.append(
+                        f"Prediction: price={pred} horizon_min={horizon} conviction={conv}"
+                    )
+                preds = latest_llm_summary.get("predictions") or []
+                if preds:
+                    def _find_pred(target_h):
+                        for p in preds:
+                            try:
+                                h = p.get("prediction_horizon_min")
+                                if h is None:
+                                    continue
+                                if abs(int(h) - target_h) <= 5:
+                                    return p
+                            except Exception:
+                                continue
+                        return None
+                    day_pred = _find_pred(1440)
+                    week_pred = _find_pred(10080)
+                    lt_bits = []
+                    if day_pred:
+                        lt_bits.append(f"1d={day_pred.get('price_prediction')}")
+                    if week_pred:
+                        lt_bits.append(f"1w={week_pred.get('price_prediction')}")
+                    if lt_bits:
+                        prompt_lines.append("Long-term: " + " | ".join(lt_bits))
+            except Exception:
+                pass
+            try:
                 dd = latest_llm_risk.get("drawdown_pct")
                 max_dd = latest_llm_risk.get("max_drawdown_pct")
                 exp = latest_llm_risk.get("exposure_ratio")
@@ -2462,6 +3029,40 @@ while True:
             except Exception:
                 prompt_lines.append(f"Perf: {latest_llm_perf}")
             try:
+                opp = latest_llm_perf.get("daily_opportunity_summary") or {}
+                if opp:
+                    stats = opp.get("prediction_horizon_stats") or {}
+                    def _hr(key):
+                        item = stats.get(str(key)) or {}
+                        return item.get("hit_rate", 0.0)
+                    prompt_lines.append(
+                        "Opportunity: "
+                        f"avg_mfe={opp.get('avg_mfe_pct', 0.0):.2%} "
+                        f"avg_mae={opp.get('avg_mae_pct', 0.0):.2%} "
+                        f"avg_post_exit={opp.get('avg_post_exit_fav_pct', 0.0):.2%} "
+                        f"post_exit>1%={opp.get('pct_post_exit_fav_gt_1pct', 0.0):.0%} "
+                        f"pred_hit={opp.get('prediction_hit_rate', 0.0):.0%} "
+                        f"avg_conv={opp.get('avg_prediction_conviction', 0.0):.2f} "
+                        f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
+                    )
+            except Exception:
+                pass
+            try:
+                wk = latest_llm_perf.get("weekly_opportunity_summary") or {}
+                if wk:
+                    stats = wk.get("prediction_horizon_stats") or {}
+                    def _hr(key):
+                        item = stats.get(str(key)) or {}
+                        return item.get("hit_rate", 0.0)
+                    prompt_lines.append(
+                        "Weekly: "
+                        f"pred_hit={wk.get('prediction_hit_rate', 0.0):.0%} "
+                        f"avg_conv={wk.get('avg_prediction_conviction', 0.0):.2f} "
+                        f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
+                    )
+            except Exception:
+                pass
+            try:
                 patterns = ", ".join(latest_llm_ta.get("candle_patterns") or [])
                 prompt_lines.append(
                     "TA: "
@@ -2478,6 +3079,9 @@ while True:
             prompt_lines.append("Recent LLM actions:")
         prompt_lines.extend(_llm_action_log[-20:])
         prompt_text = prompt_lines if prompt_lines else list(_llm_action_log)
+        _log_price_history(live_prices, now)
+        _maybe_daily_opportunity_reflection(now)
+        _maybe_weekly_opportunity_reflection(now)
         last_rss = get_last_rss_fetch_time()
         rss_active = bool(
             get_rss_active()

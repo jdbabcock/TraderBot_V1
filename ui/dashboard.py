@@ -1555,6 +1555,40 @@ class RealTimeEquityPlot:
             sl_text = f"{stop_loss:.2f}" if stop_loss is not None else "N/A"
             tp_text = f"{take_profit:.2f}" if take_profit is not None else "N/A"
             trail_text = f"{trailing_stop:.2f}" if trailing_stop is not None else "N/A"
+            pred_price = llm_decision.get("price_prediction")
+            pred_horizon = llm_decision.get("prediction_horizon_min")
+            pred_conv = llm_decision.get("conviction")
+            pred_list = llm_decision.get("predictions") if isinstance(llm_decision, dict) else None
+            pred_text = ""
+            if pred_price is not None or pred_horizon is not None or pred_conv is not None:
+                pred_price_text = f"{float(pred_price):.2f}" if pred_price is not None else "N/A"
+                pred_h_text = f"{int(pred_horizon)}m" if pred_horizon is not None else "N/A"
+                try:
+                    conv_text = f"{float(pred_conv):.2f}"
+                except Exception:
+                    conv_text = "N/A"
+                pred_text = f" | Pred: {pred_price_text} ({pred_h_text}, conv={conv_text})"
+            if isinstance(pred_list, list) and pred_list:
+                def _pick_h(target_h):
+                    for item in pred_list:
+                        try:
+                            h = item.get("prediction_horizon_min")
+                            if h is None:
+                                continue
+                            if abs(int(h) - target_h) <= 5:
+                                return item.get("price_prediction")
+                        except Exception:
+                            continue
+                    return None
+                day_pred = _pick_h(1440)
+                week_pred = _pick_h(10080)
+                lt_bits = []
+                if day_pred is not None:
+                    lt_bits.append(f"1d={day_pred:.2f}")
+                if week_pred is not None:
+                    lt_bits.append(f"1w={week_pred:.2f}")
+                if lt_bits:
+                    pred_text += f" | LT: {' '.join(lt_bits)}"
             row = tk.Frame(self.positions_frame, bg=self.panel)
             row.pack(fill=tk.X)
             arrow = "▲" if pnl_pct >= 0 else "▼"
@@ -1575,7 +1609,7 @@ class RealTimeEquityPlot:
                     f"{sym} | Value: ${current_value:.2f} (Entry: ${entry_value:.2f}) | "
                     f"Entry: {entry:.2f} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%) | "
                     f"Conf: {conf:.2f} | Source: {source} | SL: {sl_text} | TP: {tp_text} | "
-                    f"Trail: {trailing_pct:.3f} ({trail_text})"
+                    f"Trail: {trailing_pct:.3f} ({trail_text}){pred_text}"
                 ),
                 anchor="w",
                 bg=self.panel,

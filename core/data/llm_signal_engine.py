@@ -60,9 +60,13 @@ LLM_SCHEMA_VERSION = 1
 LLM_DEFAULTS = {
     "confidence": 0.5,
     "size_fraction": 0.1,
-    "stop_loss_pct": 0.01,
-    "take_profit_pct": 0.02,
-    "trailing_stop_pct": 0.02,
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.05,
+    "trailing_stop_pct": 0.03,
+    "price_prediction": None,
+    "prediction_horizon_min": 60,
+    "conviction": 0.5,
+    "predictions": [],
     "exit": False,
     "reason": "",
     "pattern_reason": "",
@@ -77,6 +81,8 @@ LLM_BOUNDS = {
     "stop_loss_pct": (0.005, 0.05),
     "take_profit_pct": (0.01, 0.1),
     "trailing_stop_pct": (0.005, 0.08),
+    "conviction": (0.0, 1.0),
+    "prediction_horizon_min": (5, 10080),
     "fill_rate_scale": (0.5, 2.0),
     "fill_spread_sensitivity": (0.5, 2.0),
     "fill_vol_sensitivity": (0.5, 2.0)
@@ -308,6 +314,47 @@ def llm_decision(
         except Exception:
             return float(default)
 
+    def _safe_optional_float(val, default=None):
+        try:
+            if val is None:
+                return default
+            if isinstance(val, str) and not val.strip():
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    def _sanitize_predictions(preds):
+        if isinstance(preds, dict):
+            preds = [preds]
+        if not isinstance(preds, list):
+            return []
+        cleaned_preds = []
+        for item in preds:
+            if not isinstance(item, dict):
+                continue
+            price = _safe_optional_float(item.get("price_prediction") or item.get("target_price") or item.get("price"))
+            horizon = _safe_optional_float(item.get("prediction_horizon_min") or item.get("horizon_min") or item.get("horizon"))
+            conv = _safe_optional_float(item.get("conviction"))
+            label = item.get("label")
+            if horizon is not None:
+                try:
+                    horizon = int(round(float(horizon)))
+                    horizon = max(LLM_BOUNDS["prediction_horizon_min"][0], min(LLM_BOUNDS["prediction_horizon_min"][1], horizon))
+                except Exception:
+                    horizon = None
+            if price is None and horizon is None and conv is None and label is None:
+                continue
+            payload = {
+                "price_prediction": price,
+                "prediction_horizon_min": horizon,
+                "conviction": conv
+            }
+            if label is not None:
+                payload["label"] = str(label)
+            cleaned_preds.append(payload)
+        return cleaned_preds
+
     def _sanitize_llm_output(output):
         if not isinstance(output, dict):
             output = {}
@@ -330,6 +377,18 @@ def llm_decision(
         cleaned["stop_loss_pct"] = _clamp(cleaned["stop_loss_pct"], *LLM_BOUNDS["stop_loss_pct"])
         cleaned["take_profit_pct"] = _clamp(cleaned["take_profit_pct"], *LLM_BOUNDS["take_profit_pct"])
         cleaned["trailing_stop_pct"] = _clamp(cleaned["trailing_stop_pct"], *LLM_BOUNDS["trailing_stop_pct"])
+        cleaned["price_prediction"] = _safe_optional_float(output.get("price_prediction"), LLM_DEFAULTS["price_prediction"])
+        horizon = _safe_optional_float(output.get("prediction_horizon_min"), LLM_DEFAULTS["prediction_horizon_min"])
+        if horizon is not None:
+            try:
+                horizon = int(round(float(horizon)))
+                horizon = max(LLM_BOUNDS["prediction_horizon_min"][0], min(LLM_BOUNDS["prediction_horizon_min"][1], horizon))
+            except Exception:
+                horizon = LLM_DEFAULTS["prediction_horizon_min"]
+        cleaned["prediction_horizon_min"] = horizon
+        cleaned["conviction"] = _safe_float(output.get("conviction", LLM_DEFAULTS["conviction"]), LLM_DEFAULTS["conviction"])
+        cleaned["conviction"] = _clamp(cleaned["conviction"], *LLM_BOUNDS["conviction"])
+        cleaned["predictions"] = _sanitize_predictions(output.get("predictions"))
         cleaned["fill_rate_scale"] = _safe_float(output.get("fill_rate_scale", LLM_DEFAULTS["fill_rate_scale"]), LLM_DEFAULTS["fill_rate_scale"])
         cleaned["fill_rate_scale"] = _clamp(cleaned["fill_rate_scale"], *LLM_BOUNDS["fill_rate_scale"])
         cleaned["fill_spread_sensitivity"] = _safe_float(output.get("fill_spread_sensitivity", LLM_DEFAULTS["fill_spread_sensitivity"]), LLM_DEFAULTS["fill_spread_sensitivity"])
@@ -429,9 +488,12 @@ def llm_decision(
             f"Execution context: {json.dumps(execution_context) if execution_context else 'N/A'}\n"
             f"Risk state: {json.dumps(risk_state) if risk_state else 'N/A'}\n"
             "You may adjust size_fraction, stop_loss_pct, take_profit_pct, and trailing_stop_pct based on the context.\n"
+            "Provide price_prediction (target price), prediction_horizon_min (minutes), and conviction (0-1). "
+            "Also include predictions as a list for horizons 60m, 1440m (1d), and 10080m (1w). "
+            "Use conviction to justify holding through temporary drawdowns with wider stops.\n"
             "Only include order_action when you truly want to trade; confidence is informational and there is no external confidence filter.\n"
             "Return ONLY a JSON object with keys:\n"
-            "confidence (0–1), size_fraction (0–1), stop_loss_pct, take_profit_pct, trailing_stop_pct, exit (bool), reason (short string), "
+            "confidence (0–1), size_fraction (0–1), stop_loss_pct, take_profit_pct, trailing_stop_pct, price_prediction, prediction_horizon_min, conviction, predictions (list), exit (bool), reason (short string), "
             "pattern_reason (short string explaining any candle pattern usage), order_action (object or null), fill_rate_scale (0.5-2.0), "
             "fill_spread_sensitivity (0.5-2.0), fill_vol_sensitivity (0.5-2.0)"
         )
