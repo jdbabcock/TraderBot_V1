@@ -925,7 +925,9 @@ def _build_perf_summary(win_count, loss_count, realized_total, trade_count, win_
         "underperforming": underperforming,
         "trade_count": trade_count,
         "daily_opportunity_summary": _daily_opportunity_summary or {},
-        "weekly_opportunity_summary": _weekly_opportunity_summary or {}
+        "weekly_opportunity_summary": _weekly_opportunity_summary or {},
+        "monthly_opportunity_summary": _monthly_opportunity_summary or {},
+        "yearly_opportunity_summary": _yearly_opportunity_summary or {}
     }
     hist_baseline = _get_historical_baseline()
     if hist_baseline is not None and hist_baseline > 0 and equity is not None:
@@ -1385,6 +1387,10 @@ _last_opportunity_day = None
 _last_candle_close_ts = {}
 _weekly_opportunity_summary = {}
 _last_opportunity_week = None
+_monthly_opportunity_summary = {}
+_last_opportunity_month = None
+_yearly_opportunity_summary = {}
+_last_opportunity_year = None
 
 def _timeframe_to_seconds(timeframe):
     tf = str(timeframe or "").strip().lower()
@@ -1800,6 +1806,204 @@ def _maybe_weekly_opportunity_reflection(now_ts):
     try:
         os.makedirs("data", exist_ok=True)
         with open(os.path.join("data", "weekly_opportunity_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+
+def _maybe_monthly_opportunity_reflection(now_ts):
+    global _monthly_opportunity_summary, _last_opportunity_month
+    local = time.localtime(now_ts)
+    if local.tm_mday != 1 or local.tm_hour < 9:
+        return
+    month_key = time.strftime("%Y-%m", local)
+    if _last_opportunity_month == month_key:
+        return
+    current_start = time.mktime((local.tm_year, local.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+    prev_year = local.tm_year
+    prev_month = local.tm_mon - 1
+    if prev_month == 0:
+        prev_month = 12
+        prev_year -= 1
+    prev_start = time.mktime((prev_year, prev_month, 1, 0, 0, 0, 0, 0, -1))
+    prev_end = current_start - 1
+    month_label = time.strftime("%Y-%m", time.localtime(prev_start))
+
+    trades = []
+    try:
+        if os.path.exists(TRADE_OUTCOMES_PATH):
+            with open(TRADE_OUTCOMES_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        trades.append(rec)
+    except Exception:
+        trades = []
+
+    symbol_prices = {}
+    try:
+        if os.path.exists(PRICE_HISTORY_PATH):
+            with open(PRICE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = row.get("ts")
+                    sym = row.get("symbol")
+                    px = row.get("price")
+                    if ts is None or sym is None or px is None:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        symbol_prices.setdefault(sym, []).append((ts, float(px)))
+    except Exception:
+        symbol_prices = {}
+    for sym in symbol_prices:
+        symbol_prices[sym].sort(key=lambda x: x[0])
+
+    predictions = []
+    try:
+        if os.path.exists(LLM_PREDICTIONS_PATH):
+            with open(LLM_PREDICTIONS_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        predictions.append(rec)
+    except Exception:
+        predictions = []
+
+    summary = _compute_daily_opportunity_summary(
+        month_label,
+        symbol_prices,
+        trades,
+        predictions
+    )
+    summary["month"] = month_label
+    _monthly_opportunity_summary = summary
+    _last_opportunity_month = month_key
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(os.path.join("data", "monthly_opportunity_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+
+def _maybe_yearly_opportunity_reflection(now_ts):
+    global _yearly_opportunity_summary, _last_opportunity_year
+    local = time.localtime(now_ts)
+    if local.tm_mon != 1 or local.tm_mday != 1 or local.tm_hour < 9:
+        return
+    year_key = time.strftime("%Y", local)
+    if _last_opportunity_year == year_key:
+        return
+    current_start = time.mktime((local.tm_year, 1, 1, 0, 0, 0, 0, 0, -1))
+    prev_year = local.tm_year - 1
+    prev_start = time.mktime((prev_year, 1, 1, 0, 0, 0, 0, 0, -1))
+    prev_end = current_start - 1
+    year_label = str(prev_year)
+
+    trades = []
+    try:
+        if os.path.exists(TRADE_OUTCOMES_PATH):
+            with open(TRADE_OUTCOMES_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        trades.append(rec)
+    except Exception:
+        trades = []
+
+    symbol_prices = {}
+    try:
+        if os.path.exists(PRICE_HISTORY_PATH):
+            with open(PRICE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = row.get("ts")
+                    sym = row.get("symbol")
+                    px = row.get("price")
+                    if ts is None or sym is None or px is None:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        symbol_prices.setdefault(sym, []).append((ts, float(px)))
+    except Exception:
+        symbol_prices = {}
+    for sym in symbol_prices:
+        symbol_prices[sym].sort(key=lambda x: x[0])
+
+    predictions = []
+    try:
+        if os.path.exists(LLM_PREDICTIONS_PATH):
+            with open(LLM_PREDICTIONS_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = rec.get("ts")
+                    if not ts:
+                        continue
+                    ts = float(ts)
+                    if prev_start <= ts <= prev_end:
+                        predictions.append(rec)
+    except Exception:
+        predictions = []
+
+    summary = _compute_daily_opportunity_summary(
+        year_label,
+        symbol_prices,
+        trades,
+        predictions
+    )
+    summary["year"] = year_label
+    _yearly_opportunity_summary = summary
+    _last_opportunity_year = year_key
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(os.path.join("data", "yearly_opportunity_summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
     except Exception:
         pass
@@ -3063,6 +3267,36 @@ while True:
             except Exception:
                 pass
             try:
+                mo = latest_llm_perf.get("monthly_opportunity_summary") or {}
+                if mo:
+                    stats = mo.get("prediction_horizon_stats") or {}
+                    def _hr(key):
+                        item = stats.get(str(key)) or {}
+                        return item.get("hit_rate", 0.0)
+                    prompt_lines.append(
+                        "Monthly: "
+                        f"pred_hit={mo.get('prediction_hit_rate', 0.0):.0%} "
+                        f"avg_conv={mo.get('avg_prediction_conviction', 0.0):.2f} "
+                        f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
+                    )
+            except Exception:
+                pass
+            try:
+                yr = latest_llm_perf.get("yearly_opportunity_summary") or {}
+                if yr:
+                    stats = yr.get("prediction_horizon_stats") or {}
+                    def _hr(key):
+                        item = stats.get(str(key)) or {}
+                        return item.get("hit_rate", 0.0)
+                    prompt_lines.append(
+                        "Yearly: "
+                        f"pred_hit={yr.get('prediction_hit_rate', 0.0):.0%} "
+                        f"avg_conv={yr.get('avg_prediction_conviction', 0.0):.2f} "
+                        f"hit_60m={_hr(60):.0%} hit_1d={_hr(1440):.0%} hit_1w={_hr(10080):.0%}"
+                    )
+            except Exception:
+                pass
+            try:
                 patterns = ", ".join(latest_llm_ta.get("candle_patterns") or [])
                 prompt_lines.append(
                     "TA: "
@@ -3082,6 +3316,8 @@ while True:
         _log_price_history(live_prices, now)
         _maybe_daily_opportunity_reflection(now)
         _maybe_weekly_opportunity_reflection(now)
+        _maybe_monthly_opportunity_reflection(now)
+        _maybe_yearly_opportunity_reflection(now)
         last_rss = get_last_rss_fetch_time()
         rss_active = bool(
             get_rss_active()
